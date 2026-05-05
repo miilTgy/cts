@@ -1,0 +1,50 @@
+# Build artifacts
+/build/
+/bin/
+/output/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Generated binaries / symlinks
+router
+evaluate
+
+# Logs and temp files
+*.log
+*.tmp
+*~
+*.swp
+*.swo
+
+# IDE/editor settings
+.vscode/
+.cache/
+__pycache__/
+.codex
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tooling
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Output files
+*.txt
+*.png
+*.jpg
+*.jpeg
+*.docx
+
+# Input files
+!samples/*.txt
+
