@@ -1,9 +1,9 @@
 
 
-请只实现 `parser.h` 和 `parser.cc`；如需对外暴露输入数据结构和 API，可适当新建/修改 `common.h`。不要实现 CTS 算法、输出文件生成器或 main 逻辑。目标是在 `main.cc` 中只需要调用一次：
+请只实现 `parser.h` 和 `parser.cc`；如需对外暴露输入数据结构和 API，可适当新建/修改 `common.h`。不要实现 CTS 算法、输出文件生成器或 main 逻辑。所有共享数据结构都必须放在 `namespace common` 中；`namespace parser` 只放 parser 相关函数。目标是在 `main.cc` 中只需要调用一次：
 
 ```cpp
-parser::Problem problem = parser::parse(in_path);
+common::Problem problem = parser::parse(in_path);
 ```
 
 即可读入 HW3 输入文件，并把 DIE、SOURCE、SINK、BUFFER_TYPE 信息存入结构体。
@@ -41,10 +41,10 @@ BUFFER_TYPE BUF_BIG 7 7 10
 
 ## 文件与 namespace 要求
 
-- 所有 parser 相关内容放在 `namespace parser` 中。
+- 所有 parser 相关函数放在 `namespace parser` 中。
 - `parser.h`：声明对外 API。
 - `parser.cc`：实现具体解析逻辑。
-- `common.h`：放需要被其他模块使用的数据结构。
+- `common.h`：放需要被其他模块使用的数据结构，且这些结构体全部位于 `namespace common` 中。
 - 不要使用 `try / catch / exception` 作为主要错误处理方式，尽量使用 `if-else` 检查并返回错误状态/打印错误。
 - 可使用 C++ 标准库的 `std::ifstream`、`std::getline`、`std::istringstream`、`std::vector`、`std::string`、`std::cerr` 等。
 
@@ -99,8 +99,8 @@ struct Problem {
 namespace parser {
 
 void debug_enable(bool enable);
-void debug_output(const Problem& problem);
-Problem parse(const std::string& in_path);
+void debug_output(const common::Problem& problem);
+common::Problem parse(const std::string& in_path);
 
 }  // namespace parser
 ```
@@ -111,11 +111,11 @@ Problem parse(const std::string& in_path);
 
 1. 内部维护一个 `static bool g_debug_enabled = false;`。
 2. `debug_enable(bool enable)` 用于设置 debug 开关。
-3. `debug_output(const Problem& problem)`：
+3. `debug_output(const common::Problem& problem)`：
    - 当 debug 关闭时直接 return。
    - 当 debug 开启时，打印：die size、source id/坐标、sink 数量和列表、buffer type 数量和列表、valid/error_msg。
 4. `parse(const std::string& in_path)`：
-   - 打开输入文件；如果失败，返回 `Problem{.valid=false}` 并写入 `error_msg`。
+   - 打开输入文件；如果失败，返回 `common::Problem{.valid=false}` 并写入 `error_msg`。
    - 逐 token 读取，自动跳过空白和空行。
    - 按顺序解析：`DIE`、`SOURCE`、`NUM_SINKS`、N 行 `SINK`、`NUM_BUFFERS`、B 行 `BUFFER_TYPE`。
    - 每一步都检查 keyword 是否正确；若不正确，设置 `valid=false` 和清晰的 `error_msg` 后返回。
@@ -130,6 +130,7 @@ Problem parse(const std::string& in_path);
 使用类似下面的模式，不要写复杂 parser framework：
 
 ```cpp
+common::Problem problem;
 std::ifstream fin(in_path);
 if (!fin) {
     problem.valid = false;
@@ -149,9 +150,9 @@ fin >> problem.die_width >> problem.die_height;
 对 `SOURCE`、`SINK`、`BUFFER_TYPE` 建议写小的 helper function，例如：
 
 ```cpp
-static bool read_sink(std::istream& in, const std::string& expected_keyword, Sink& sink, std::string& err);
-static bool read_buffer_type(std::istream& in, BufferType& buf, std::string& err);
-static bool check_point_in_die(const Problem& problem, const Point& p, std::string& err);
+static bool read_sink(std::istream& in, const std::string& expected_keyword, common::Sink& sink, std::string& err);
+static bool read_buffer_type(std::istream& in, common::BufferType& buf, std::string& err);
+static bool check_point_in_die(const common::Problem& problem, const common::Point& p, std::string& err);
 ```
 
 但 helper 函数只放在 `parser.cc` 的匿名 namespace 或 `static` 函数中，不暴露到外部。
@@ -169,7 +170,7 @@ int main(int argc, char** argv) {
     }
 
     parser::debug_enable(true);
-    parser::Problem problem = parser::parse(argv[1]);
+    common::Problem problem = parser::parse(argv[1]);
 
     if (!problem.valid) {
         return 1;
