@@ -4,7 +4,7 @@
 
 # Buffered-DME (Deferred-Merge Embedding)
 
-topology generation -> DME bottom-up with optional buffer -> DME top-down
+topology generation -> DME bottom-up with optional buffer -> DME top-down allocation -> bottom-up route
 
 # 优先级
 
