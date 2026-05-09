@@ -67,6 +67,26 @@ struct TopologyTree {
     std::string error_msg;
 };
 
+struct PartitionNode {
+    int id = -1;
+    std::vector<int> children;
+    std::vector<int> sink_indices;
+    int bbox_lx = 0;
+    int bbox_ly = 0;
+    int bbox_ux = 0;
+    int bbox_uy = 0;
+    Point centroid;
+    bool is_leaf = false;
+    bool is_outlier = false;
+};
+
+struct PartitionTree {
+    std::vector<PartitionNode> nodes;
+    int root = -1;
+    bool valid = false;
+    std::string error_msg;
+};
+
 struct SegmentPoint {
     double x = 0.0;
     double y = 0.0;
