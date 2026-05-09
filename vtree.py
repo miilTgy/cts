@@ -200,11 +200,74 @@ def parse_sample_file(path: str) -> Tuple[int, int, float, float]:
     return width, height, source_x, source_y
 
 
-def compute_max_est_skew(nodes: Dict[int, Node], leaf_info: Dict[int, LeafInfo]) -> float:
+def get_leaf_pos(node_id: int, leaf_info: Dict[int, LeafInfo]) -> Tuple[float, float]:
+    _, _, x, y = leaf_info[node_id]
+    return float(x), float(y)
+
+
+def get_node_debug_pos(
+    node_id: int,
+    nodes: Dict[int, Node],
+    leaf_info: Dict[int, LeafInfo],
+) -> GeoPos:
+    if node_id in leaf_info:
+        return get_leaf_pos(node_id, leaf_info)
+
+    node = nodes.get(node_id)
+    if node is None:
+        warn(f"missing node {node_id}; no debug position available")
+        return None
+
+    return node.cx, node.cy
+
+
+def manhattan(x1: float, y1: float, x2: float, y2: float) -> float:
+    return abs(x1 - x2) + abs(y1 - y2)
+
+
+def compute_max_est_skew(
+    root: int,
+    nodes: Dict[int, Node],
+    leaf_info: Dict[int, LeafInfo],
+    source_pos: Tuple[float, float],
+) -> float:
     leaf_delays = []
-    for node_id in leaf_info:
-        if node_id in nodes:
-            leaf_delays.append(nodes[node_id].est_delay)
+    for leaf_id in leaf_info:
+        if leaf_id not in nodes:
+            warn(f"skew skipped missing leaf node {leaf_id}")
+            continue
+
+        total = 0.0
+        current = leaf_id
+        while current != root:
+            node = nodes.get(current)
+            if node is None:
+                warn(f"skew path from leaf {leaf_id} stopped at missing node {current}")
+                break
+
+            parent_id = node.parent
+            parent = nodes.get(parent_id)
+            if parent is None:
+                warn(f"skew path from leaf {leaf_id} stopped at missing parent {parent_id}")
+                break
+
+            current_pos = get_node_debug_pos(current, nodes, leaf_info)
+            parent_pos = get_node_debug_pos(parent_id, nodes, leaf_info)
+            if current_pos is None or parent_pos is None:
+                warn(f"skew path from leaf {leaf_id} stopped at missing geometry")
+                break
+
+            cx, cy = current_pos
+            px, py = parent_pos
+            total += manhattan(cx, cy, px, py)
+            current = parent_id
+        else:
+            root_node = nodes.get(root)
+            if root_node is None:
+                warn(f"skew skipped root-to-source segment because root node {root} is missing")
+            else:
+                total += manhattan(root_node.cx, root_node.cy, source_pos[0], source_pos[1])
+            leaf_delays.append(total)
 
     if not leaf_delays:
         return 0.0
@@ -320,17 +383,57 @@ def draw_topology(
     ax.axis("off")
 
 
-def get_geo_pos(node_id: int, nodes: Dict[int, Node], leaf_info: Dict[int, LeafInfo]) -> GeoPos:
-    if node_id in leaf_info:
-        _, _, x, y = leaf_info[node_id]
-        return float(x), float(y)
+def compute_grid_visual_pos(
+    root: int,
+    nodes: Dict[int, Node],
+    leaf_info: Dict[int, LeafInfo],
+) -> Dict[int, Tuple[float, float]]:
+    visual_pos: Dict[int, Tuple[float, float]] = {}
+    visiting = set()
 
-    node = nodes.get(node_id)
-    if node is None:
-        warn(f"missing node {node_id}; no geometry position available")
-        return None
+    def dfs(node_id: int) -> GeoPos:
+        if node_id in visual_pos:
+            return visual_pos[node_id]
+        if node_id in visiting:
+            warn(f"grid visual position skipped recursive cycle at node {node_id}")
+            return None
 
-    return node.cx, node.cy
+        node = nodes.get(node_id)
+        if node is None:
+            warn(f"grid visual position skipped missing node {node_id}")
+            return None
+
+        visiting.add(node_id)
+        if node.is_leaf:
+            if node_id not in leaf_info:
+                warn(f"grid visual position skipped leaf {node_id} without LEAF record")
+                visiting.remove(node_id)
+                return None
+            visual_pos[node_id] = get_leaf_pos(node_id, leaf_info)
+        else:
+            left_id = node.left
+            right_id = node.right
+            if left_id < 0 or right_id < 0:
+                warn(f"grid visual position skipped incomplete children of node {node_id}")
+                visiting.remove(node_id)
+                return None
+
+            left_pos = dfs(left_id)
+            right_pos = dfs(right_id)
+            if left_pos is None or right_pos is None:
+                warn(f"grid visual position skipped node {node_id} because child position is missing")
+                visiting.remove(node_id)
+                return None
+
+            ux = (left_pos[0] + right_pos[0]) / 2.0
+            uy = (left_pos[1] + right_pos[1]) / 2.0
+            visual_pos[node_id] = (ux, uy)
+
+        visiting.remove(node_id)
+        return visual_pos[node_id]
+
+    dfs(root)
+    return visual_pos
 
 
 def draw_grid_tree(
@@ -343,46 +446,86 @@ def draw_grid_tree(
     height: int,
     source_pos: Tuple[float, float],
 ) -> None:
+    visual_pos = compute_grid_visual_pos(root, nodes, leaf_info)
     num_sinks = max(1, len(leaf_info))
-    sink_marker_size = max(14, min(50, int(800 / num_sinks)))
     sink_font_size = max(3, min(6, int(70 / num_sinks)))
+    visited = set()
 
-    for parent_id, child_id in edges:
-        if parent_id == root:
-            px, py = source_pos
-        else:
-            geo = get_geo_pos(parent_id, nodes, leaf_info)
-            if geo is None:
-                warn(f"geometry edge {parent_id}->{child_id} skipped because parent position is missing")
-                continue
-            px, py = geo
+    ax.set_xlim(0, width)
+    ax.set_ylim(0, height)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, linewidth=0.5, alpha=0.4)
+    ax.set_title("Tree on Die Grid")
 
-        if child_id == root:
-            cx, cy = source_pos
-        else:
-            geo = get_geo_pos(child_id, nodes, leaf_info)
-            if geo is None:
-                warn(f"geometry edge {parent_id}->{child_id} skipped because child position is missing")
-                continue
-            cx, cy = geo
+    def draw_branch(node_id: int) -> None:
+        if node_id in visited:
+            warn(f"geometry branch recursion skipped repeated node {node_id}")
+            return
+        visited.add(node_id)
 
-        ax.plot([px, cx], [py, cy], color="black", linewidth=2.5, zorder=2)
+        node = nodes.get(node_id)
+        if node is None:
+            warn(f"geometry branch skipped missing node {node_id}")
+            return
+        if node.is_leaf:
+            return
+
+        left_id = node.left
+        right_id = node.right
+        if node_id not in visual_pos or left_id not in visual_pos or right_id not in visual_pos:
+            warn(f"geometry branch skipped node {node_id} because visual position is missing")
+            return
+
+        parent_pos = visual_pos[node_id]
+        left_pos = visual_pos[left_id]
+        right_pos = visual_pos[right_id]
+
+        px, py = parent_pos
+        lx, ly = left_pos
+        rx, ry = right_pos
+
+        ax.plot([px, lx], [py, ly], color="black", linewidth=2.8, zorder=1)
+        ax.plot([px, rx], [py, ry], color="black", linewidth=2.8, zorder=1)
+
+        draw_branch(left_id)
+        draw_branch(right_id)
+
+    draw_branch(root)
+    root_pos = visual_pos.get(root)
+    if root_pos is not None:
+        ax.plot(
+            [source_pos[0], root_pos[0]],
+            [source_pos[1], root_pos[1]],
+            color="black",
+            linewidth=2.8,
+            zorder=1,
+        )
+    else:
+        warn(f"source-to-root connection skipped because root visual position is missing")
 
     internal_xs = []
     internal_ys = []
     for node_id, node in nodes.items():
-        if node_id == root or node_id in leaf_info:
+        if node.is_leaf:
             continue
-        geo_pos = get_geo_pos(node_id, nodes, leaf_info)
-        if geo_pos is None:
-            warn(f"geometry point for node {node_id} skipped because position is missing")
+        if node_id not in visual_pos:
+            warn(f"geometry tap for node {node_id} skipped because visual position is missing")
             continue
-        x, y = geo_pos
+        x, y = visual_pos[node_id]
         internal_xs.append(x)
         internal_ys.append(y)
 
     if internal_xs:
-        ax.scatter(internal_xs, internal_ys, color="black", s=15, zorder=4)
+        ax.scatter(
+            internal_xs,
+            internal_ys,
+            marker="o",
+            s=55,
+            facecolors="white",
+            edgecolors="red",
+            linewidths=2.0,
+            zorder=6,
+        )
 
     sink_xs = []
     sink_ys = []
@@ -395,16 +538,14 @@ def draw_grid_tree(
     if sink_xs:
         ax.scatter(
             sink_xs, sink_ys,
-            marker="s",
-            s=sink_marker_size,
-            facecolors="royalblue",
-            edgecolors="navy",
-            linewidths=0.8,
+            marker="o",
+            s=45,
+            color="black",
             zorder=5,
         )
         for x, y, label in zip(sink_xs, sink_ys, sink_ids):
-            ax.text(x, y, label, ha="center", va="bottom", fontsize=sink_font_size,
-                    fontweight="bold", color="navy", zorder=6)
+            ax.text(x, y, label, ha="center", va="center", fontsize=sink_font_size,
+                    color="black", zorder=7)
 
     sx, sy = source_pos
     ax.scatter(
@@ -414,16 +555,10 @@ def draw_grid_tree(
         facecolors="red",
         edgecolors="darkred",
         linewidths=1.5,
-        zorder=7,
+        zorder=10,
     )
-    ax.text(sx, sy, "SRC", ha="center", va="bottom", fontsize=7,
-            fontweight="bold", color="darkred", zorder=8)
-
-    ax.set_xlim(0, width)
-    ax.set_ylim(0, height)
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(True, linewidth=0.5, alpha=0.4)
-    ax.set_title("Tree on Die Grid")
+    ax.text(sx, sy, "SRC", ha="center", va="bottom", fontsize=10,
+            color="darkred", zorder=11)
 
 
 def print_usage() -> None:
@@ -448,7 +583,7 @@ def main() -> None:
     root, nodes, leaf_info, edges = parse_tree_file(tree_path)
     width, height, source_x, source_y = parse_sample_file(sample_path)
     source_pos = (source_x, source_y)
-    max_est_skew = compute_max_est_skew(nodes, leaf_info)
+    max_est_skew = compute_max_est_skew(root, nodes, leaf_info, source_pos)
     print(f"max_est_skew = {max_est_skew:.3f}")
     num_leaves = max(1, len(leaf_info))
     max_depth = compute_tree_depth(root, nodes)
