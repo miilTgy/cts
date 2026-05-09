@@ -18,7 +18,7 @@ ROOT 28
 NUM_NODES 29
 NUM_SINKS 15
 
-NODE <id> <parent> <left> <right> <is_leaf> <sink_index> <sink_count> <cx> <cy> <bbox_lx> <bbox_ly> <bbox_ux> <bbox_uy> <est_delay>
+NODE <id> <parent> <left> <right> <is_leaf> <sink_index> <sink_count> <cx> <cy> <bbox_lx> <bbox_ly> <bbox_ux> <bbox_uy> <region_lx> <region_ly> <region_ux> <region_uy> <est_delay>
 ...
 
 LEAF <node_id> <sink_index> <sink_id> <x> <y>
@@ -41,12 +41,15 @@ EDGE <parent_id> <child_id>
 其中 `NODE` 行字段含义为：
 
 ```text
-NODE id parent left right is_leaf sink_index sink_count cx cy bbox_lx bbox_ly bbox_ux bbox_uy est_delay
+NODE id parent left right is_leaf sink_index sink_count cx cy bbox_lx bbox_ly bbox_ux bbox_uy region_lx region_ly region_ux region_uy est_delay
 ```
 
 注意：
 
 - `cx/cy` 是 topology generation 阶段的抽象 cluster center。
+- 新版 treer 的 `cx/cy` 对 internal node 是 separator-aware MMM abstract center。
+- `region_*` 是该 subtree 的 slicing-owned debug region，用于可视化/检查区域切分。
+- 为了兼容旧 debug 文件，`vtree.py` 可以同时接受不含 `region_*` 的旧版 `NODE` 行；旧版行解析时 region 字段可填 0。
 - leaf node 的真实 sink 坐标可从 `LEAF` 行读取。
 - internal node 的真实 DME 坐标尚未生成，右侧几何图中暂时使用 `cx/cy` 作为该 internal node 的可视化位置。
 
@@ -91,6 +94,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 ```
 
+如果运行环境没有交互式图形窗口，脚本应能使用非交互 matplotlib backend（例如 `Agg`），并把图片保存到：
+
+```text
+tree/sample<k>_vtree.png
+```
+
+如果用户显式设置了交互式 `MPLBACKEND`，可以使用 `plt.show()` 打开窗口。
+
 ## 数据结构建议
 
 使用 dataclass：
@@ -111,6 +122,10 @@ class Node:
     bbox_ly: int
     bbox_ux: int
     bbox_uy: int
+    region_lx: int
+    region_ly: int
+    region_ux: int
+    region_uy: int
     est_delay: float
 ```
 
@@ -149,6 +164,8 @@ root, nodes, leaf_info, edges
 - 根据首 token 判断行类型。
 - `TREE_VALID` 必须为 1，否则打印错误并退出。
 - `NODE` 行解析成 `Node`。
+- `NODE` 行应优先解析新版 18 个值（不含开头 `NODE` token）：`... bbox_uy region_lx region_ly region_ux region_uy est_delay`。
+- 若遇到旧版 14 个值（不含开头 `NODE` token）：`... bbox_uy est_delay`，也应兼容解析，并把 `region_*` 设为 0。
 - `LEAF` 行解析成 `leaf_info`。
 - `EDGE` 行解析成 `(parent, child)`。
 
@@ -337,7 +354,7 @@ ax.add_patch(circle)
 - edge 一律用粗黑线。
 - node 和 sink 全部用黑圆点。
 - 右侧图中不要标 node 名字、sink 名字或编号。
-- internal node 暂时使用 `NODE` 行中的 `cx/cy` 作为位置。
+- internal node 暂时使用 `NODE` 行中的 `cx/cy` 作为位置；新版 treer 中它是 region-aware separator center。
 - leaf/sink node 使用 `LEAF` 行中的真实 sink 坐标。
 
 请实现：
@@ -457,11 +474,16 @@ draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height)
 fig.suptitle(f"Topology Tree Visualization: sample{idx} | max_est_skew={max_est_skew:.3f}")
 ```
 
-9. 调用：
+9. 根据 matplotlib backend 输出：
 
 ```python
-plt.tight_layout()
-plt.show()
+backend = plt.get_backend().lower()
+if "agg" in backend or "pdf" in backend or "svg" in backend:
+    output_path = f"tree/sample{idx}_vtree.png"
+    fig.savefig(output_path, dpi=160)
+    print(f"saved visualization: {output_path}")
+else:
+    plt.show()
 ```
 
 ## 输出效果要求
@@ -472,10 +494,11 @@ plt.show()
 python3 vtree.py 1
 ```
 
-应弹出一个 matplotlib 窗口：
+应弹出一个 matplotlib 窗口；如果当前环境使用非交互 backend，则应保存图片到 `tree/sample1_vtree.png`：
 
 - 左侧：二叉树拓扑结构；圆片中 internal node 显示 node id，sink leaf 显示 sink id。
 - 右侧：die grid 上的 tree 几何连接；所有 edge 是粗黑线，所有 node/sink 是黑圆点，不显示文字。
 - 终端输出 `max_est_skew = ...`。
+- 非交互 backend 下终端额外输出 `saved visualization: tree/sample<k>_vtree.png`。
 - figure 总标题中显示 `max_est_skew=...`。
 - 当 sample 的 sink 数量较多时，figure 会自动变大，左侧 topology subplot 会获得更多宽度，node 圆片和字体会自动缩小，尽量避免文字溢出和节点互相遮挡。

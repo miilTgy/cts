@@ -21,6 +21,10 @@ class Node:
     bbox_ly: int
     bbox_ux: int
     bbox_uy: int
+    region_lx: int
+    region_ly: int
+    region_ux: int
+    region_uy: int
     est_delay: float
 
 
@@ -86,12 +90,24 @@ def parse_tree_file(path: str):
                     fail(f"{path}:{line_no}: NUM_SINKS expects 1 value")
                 num_sinks = parse_int(parts[1], "NUM_SINKS")
             elif kind == "NODE":
-                if len(parts) != 15:
+                if len(parts) not in (15, 19):
                     fail(
-                        f"{path}:{line_no}: NODE expects 14 values after NODE, "
+                        f"{path}:{line_no}: NODE expects 14 or 18 values after NODE, "
                         f"got {len(parts) - 1}"
                     )
                 node_id = parse_int(parts[1], "NODE id")
+                if len(parts) == 19:
+                    region_lx = parse_int(parts[14], "NODE region_lx")
+                    region_ly = parse_int(parts[15], "NODE region_ly")
+                    region_ux = parse_int(parts[16], "NODE region_ux")
+                    region_uy = parse_int(parts[17], "NODE region_uy")
+                    est_delay = parse_float(parts[18], "NODE est_delay")
+                else:
+                    region_lx = 0
+                    region_ly = 0
+                    region_ux = 0
+                    region_uy = 0
+                    est_delay = parse_float(parts[14], "NODE est_delay")
                 node = Node(
                     id=node_id,
                     parent=parse_int(parts[2], "NODE parent"),
@@ -106,7 +122,11 @@ def parse_tree_file(path: str):
                     bbox_ly=parse_int(parts[11], "NODE bbox_ly"),
                     bbox_ux=parse_int(parts[12], "NODE bbox_ux"),
                     bbox_uy=parse_int(parts[13], "NODE bbox_uy"),
-                    est_delay=parse_float(parts[14], "NODE est_delay"),
+                    region_lx=region_lx,
+                    region_ly=region_ly,
+                    region_ux=region_ux,
+                    region_uy=region_uy,
+                    est_delay=est_delay,
                 )
                 nodes[node_id] = node
             elif kind == "LEAF":
@@ -361,6 +381,9 @@ def main() -> None:
         except OSError:
             pass
 
+    if "MPLBACKEND" not in os.environ:
+        os.environ["MPLBACKEND"] = "Agg"
+
     global plt
     import matplotlib.pyplot as plt
 
@@ -377,8 +400,14 @@ def main() -> None:
     draw_topology(ax1, root, nodes, leaf_info, edges)
     draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height)
     fig.suptitle(f"Topology Tree Visualization: sample{idx} | max_est_skew={max_est_skew:.3f}")
-    plt.tight_layout()
-    plt.show()
+
+    backend = plt.get_backend().lower()
+    if "agg" in backend or "pdf" in backend or "svg" in backend:
+        output_path = f"tree/sample{idx}_vtree.png"
+        fig.savefig(output_path, dpi=160)
+        print(f"saved visualization: {output_path}")
+    else:
+        plt.show()
 
 
 if __name__ == "__main__":
