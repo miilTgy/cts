@@ -166,7 +166,14 @@ def parse_tree_file(path: str):
     return root, nodes, leaf_info, edges
 
 
-def parse_die_size(path: str) -> Tuple[int, int]:
+def parse_sample_file(path: str) -> Tuple[int, int, float, float]:
+    width = 0
+    height = 0
+    source_x = 0.0
+    source_y = 0.0
+    has_die = False
+    has_source = False
+
     with open(path, "r") as f:
         for line_no, line in enumerate(f, start=1):
             parts = line.split()
@@ -177,9 +184,20 @@ def parse_die_size(path: str) -> Tuple[int, int]:
                     fail(f"{path}:{line_no}: DIE expects width and height")
                 width = parse_int(parts[1], "DIE width")
                 height = parse_int(parts[2], "DIE height")
-                return width, height
+                has_die = True
+            elif parts[0] == "SOURCE":
+                if len(parts) != 4:
+                    fail(f"{path}:{line_no}: SOURCE expects id x y")
+                source_x = parse_float(parts[2], "SOURCE x")
+                source_y = parse_float(parts[3], "SOURCE y")
+                has_source = True
 
-    fail(f"{path}: missing DIE <width> <height>")
+    if not has_die:
+        fail(f"{path}: missing DIE <width> <height>")
+    if not has_source:
+        fail(f"{path}: missing SOURCE line")
+
+    return width, height, source_x, source_y
 
 
 def compute_max_est_skew(nodes: Dict[int, Node], leaf_info: Dict[int, LeafInfo]) -> float:
@@ -269,12 +287,15 @@ def draw_topology(
 
     for node_id, (x, y) in pos.items():
         node = nodes[node_id]
+        is_root = node_id == root
+        facecolor = "gold" if is_root else "white"
+        edgecolor = "darkorange" if is_root else "black"
         ax.scatter(
             [x],
             [y],
             s=marker_size,
-            facecolors="white",
-            edgecolors="black",
+            facecolors=facecolor,
+            edgecolors=edgecolor,
             linewidths=1.0,
             zorder=3,
         )
@@ -283,6 +304,10 @@ def draw_topology(
         else:
             label = str(node_id)
         ax.text(x, y, label, ha="center", va="center", fontsize=font_size, zorder=4)
+        if is_root:
+            ax.text(x, y - 0.4, "ROOT", ha="center", va="top",
+                    fontsize=font_size * 0.85, fontweight="bold",
+                    color="darkorange", zorder=5)
 
     if pos:
         xs = [p[0] for p in pos.values()]
@@ -316,31 +341,84 @@ def draw_grid_tree(
     edges: List[Tuple[int, int]],
     width: int,
     height: int,
+    source_pos: Tuple[float, float],
 ) -> None:
-    del root
+    num_sinks = max(1, len(leaf_info))
+    sink_marker_size = max(14, min(50, int(800 / num_sinks)))
+    sink_font_size = max(3, min(6, int(70 / num_sinks)))
 
     for parent_id, child_id in edges:
-        parent_pos = get_geo_pos(parent_id, nodes, leaf_info)
-        child_pos = get_geo_pos(child_id, nodes, leaf_info)
-        if parent_pos is None or child_pos is None:
-            warn(f"geometry edge {parent_id}->{child_id} skipped because position is missing")
-            continue
-        x1, y1 = parent_pos
-        x2, y2 = child_pos
-        ax.plot([x1, x2], [y1, y2], color="black", linewidth=2.5, zorder=2)
+        if parent_id == root:
+            px, py = source_pos
+        else:
+            geo = get_geo_pos(parent_id, nodes, leaf_info)
+            if geo is None:
+                warn(f"geometry edge {parent_id}->{child_id} skipped because parent position is missing")
+                continue
+            px, py = geo
 
-    xs = []
-    ys = []
-    for node_id in sorted(nodes):
+        if child_id == root:
+            cx, cy = source_pos
+        else:
+            geo = get_geo_pos(child_id, nodes, leaf_info)
+            if geo is None:
+                warn(f"geometry edge {parent_id}->{child_id} skipped because child position is missing")
+                continue
+            cx, cy = geo
+
+        ax.plot([px, cx], [py, cy], color="black", linewidth=2.5, zorder=2)
+
+    internal_xs = []
+    internal_ys = []
+    for node_id, node in nodes.items():
+        if node_id == root or node_id in leaf_info:
+            continue
         geo_pos = get_geo_pos(node_id, nodes, leaf_info)
         if geo_pos is None:
             warn(f"geometry point for node {node_id} skipped because position is missing")
             continue
         x, y = geo_pos
-        xs.append(x)
-        ys.append(y)
+        internal_xs.append(x)
+        internal_ys.append(y)
 
-    ax.scatter(xs, ys, color="black", s=20, zorder=3)
+    if internal_xs:
+        ax.scatter(internal_xs, internal_ys, color="black", s=15, zorder=4)
+
+    sink_xs = []
+    sink_ys = []
+    sink_ids = []
+    for node_id, (sink_index, sink_id, lx, ly) in leaf_info.items():
+        sink_xs.append(float(lx))
+        sink_ys.append(float(ly))
+        sink_ids.append(sink_id)
+
+    if sink_xs:
+        ax.scatter(
+            sink_xs, sink_ys,
+            marker="s",
+            s=sink_marker_size,
+            facecolors="royalblue",
+            edgecolors="navy",
+            linewidths=0.8,
+            zorder=5,
+        )
+        for x, y, label in zip(sink_xs, sink_ys, sink_ids):
+            ax.text(x, y, label, ha="center", va="bottom", fontsize=sink_font_size,
+                    fontweight="bold", color="navy", zorder=6)
+
+    sx, sy = source_pos
+    ax.scatter(
+        [sx], [sy],
+        marker="^",
+        s=120,
+        facecolors="red",
+        edgecolors="darkred",
+        linewidths=1.5,
+        zorder=7,
+    )
+    ax.text(sx, sy, "SRC", ha="center", va="bottom", fontsize=7,
+            fontweight="bold", color="darkred", zorder=8)
+
     ax.set_xlim(0, width)
     ax.set_ylim(0, height)
     ax.set_aspect("equal", adjustable="box")
@@ -368,7 +446,8 @@ def main() -> None:
         fail(f"sample file not found: {sample_path}")
 
     root, nodes, leaf_info, edges = parse_tree_file(tree_path)
-    width, height = parse_die_size(sample_path)
+    width, height, source_x, source_y = parse_sample_file(sample_path)
+    source_pos = (source_x, source_y)
     max_est_skew = compute_max_est_skew(nodes, leaf_info)
     print(f"max_est_skew = {max_est_skew:.3f}")
     num_leaves = max(1, len(leaf_info))
@@ -398,7 +477,7 @@ def main() -> None:
         gridspec_kw={"width_ratios": [1.4, 1.0]},
     )
     draw_topology(ax1, root, nodes, leaf_info, edges)
-    draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height)
+    draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height, source_pos)
     fig.suptitle(f"Topology Tree Visualization: sample{idx} | max_est_skew={max_est_skew:.3f}")
 
     backend = plt.get_backend().lower()

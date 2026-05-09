@@ -61,19 +61,21 @@ NODE id parent left right is_leaf sink_index sink_count cx cy bbox_lx bbox_ly bb
 samples/sample<k>.txt
 ```
 
-需要从中读取 die grid 大小：
+需要从中读取 die grid 大小和时钟源坐标：
 
 ```text
 DIE <width> <height>
+SOURCE <id> <x> <y>
 ```
 
 例如：
 
 ```text
 DIE 130 120
+SOURCE SRC 64 60
 ```
 
-右侧 grid 图的 x 范围为 `[0, width]`，y 范围为 `[0, height]`。
+右侧 grid 图的 x 范围为 `[0, width]`，y 范围为 `[0, height]`。SOURCE 坐标用于在右侧 grid 图中绘制时钟源（红色三角形的起点）。
 
 ## 依赖要求
 
@@ -172,22 +174,23 @@ root, nodes, leaf_info, edges
 请实现：
 
 ```python
-def parse_die_size(path: str):
+def parse_sample_file(path: str):
     ...
 ```
 
 返回：
 
 ```python
-width, height
+width, height, source_x, source_y
 ```
 
 解析规则：
 
 - 打开 `samples/sample<k>.txt`。
 - 逐 token 或逐行读取。
-- 找到 `DIE <width> <height>` 后返回。
-- 如果找不到 DIE，打印错误并退出。
+- 找到 `DIE <width> <height>` 后记录 die 尺寸。
+- 找到 `SOURCE <id> <x> <y>` 后记录 source 坐标。
+- 如果找不到 DIE 或 SOURCE，打印错误并退出。
 
 ## max_est_skew 计算
 
@@ -243,6 +246,8 @@ return max(leaf_delays) - min(leaf_delays)
 - 每个 node 用圆片表示。
 - internal node 的圆片中间显示 node 的 `<id>`。
 - sink/leaf node 的圆片中间显示 `<sink_id>`，例如 `L0`、`R3`。
+- **root node（时钟源）**用金色（`facecolors="gold"`）填充、深橙色（`edgecolors="darkorange"`）边框，并在圆片下方标注小号 "ROOT" 文字，以便一眼识别树的起点。
+- 其他 internal node 用白底黑边圆片。
 - parent-child edge 用黑线连接。
 - root 在最上方，leaf 在最下方。
 - 二叉树左右顺序按 `left/right` 字段。
@@ -318,6 +323,7 @@ font_size = max(4, min(8, int(150 / max(num_leaves, 1))))
 ```
 
 - 推荐画 node 的方式：先用 `ax.scatter([x], [y], s=marker_size, facecolors="white", edgecolors="black", linewidths=1.0, zorder=3)` 画圆片，再用 `ax.text(x, y, label, ha="center", va="center", fontsize=font_size, zorder=4)` 在圆片中心写 id 或 sink_id。
+- 对于 root node：`facecolors="gold"`、`edgecolors="darkorange"`，下方加 `ax.text(x, y - 0.4, "ROOT", ...)` 标注。
 - 如果 label 仍然溢出，优先缩小 `font_size`；不要为了容纳文字把圆片变成椭圆。
 - 左侧 topology 图继续使用 `ax.set_aspect("auto")`，否则节点多时整棵树会被压得很小。但正因为使用 `auto`，所以 node 必须用 screen-space marker，而不能用 data-coordinate circle patch。
 - 根据布局结果设置边界，例如：
@@ -352,10 +358,13 @@ ax.add_patch(circle)
 - 坐标系和输入坐标一致：x 向右，y 向上。
 - 画出网格线。
 - edge 一律用粗黑线。
-- node 和 sink 全部用黑圆点。
-- 右侧图中不要标 node 名字、sink 名字或编号。
+- 右侧图中区分三种节点：
+  - **Source（时钟源根节点）**：红色向上三角形 `marker="^"`，较大（`s=120`），红色填充（`facecolors="red"`）、深红边框（`edgecolors="darkred"`），旁注 "**SRC**" 文字标签。
+  - **Sink（叶节点）**：蓝色正方形 `marker="s"`，大小自适应 sink 数量（`sink_marker_size = max(14, min(50, int(800 / num_sinks)))`），宝蓝色填充（`facecolors="royalblue"`）、海蓝边框（`edgecolors="navy"`），每颗标注其 sink_id（如 "L0"、"R3"），字体大小自适应（`sink_font_size = max(3, min(6, int(70 / num_sinks)))`）。
+  - **Internal node（中间节点）**：小黑圆点（`color="black", s=15`），不标注文字。
 - internal node 暂时使用 `NODE` 行中的 `cx/cy` 作为位置；新版 treer 中它是 region-aware separator center。
 - leaf/sink node 使用 `LEAF` 行中的真实 sink 坐标。
+- source 使用 `SOURCE` 行中解析出的坐标；root node 的 edges 从 source 坐标连出，不使用 root NODE 行的 `cx/cy`。
 
 请实现：
 
@@ -376,18 +385,26 @@ else:
 请实现：
 
 ```python
-def draw_grid_tree(ax, root, nodes, leaf_info, edges, width, height):
+def draw_grid_tree(ax, root, nodes, leaf_info, edges, width, height, source_pos):
     ...
 ```
 
 绘制要求：
 
 - 对每条 `EDGE parent child`：
-  - 取 parent 和 child 的几何位置。
+  - 若 parent 为 root node，使用 `source_pos` 作为 parent 坐标；否则取 `get_geo_pos(parent_id, ...)`
+  - 若 child 为 root node，使用 `source_pos` 作为 child 坐标；否则取 `get_geo_pos(child_id, ...)`
   - 用 `ax.plot([x1, x2], [y1, y2], color="black", linewidth=2.5)` 画粗黑线。
-- 对所有 node：
-  - 取几何位置。
-  - 用 `ax.scatter(xs, ys, color="black", s=20, zorder=3)` 画黑圆点。
+- 画 internal node（非 root 非 leaf）：
+  - 收集所有 non-root、non-leaf node 的几何位置。
+  - 用 `ax.scatter(xs, ys, color="black", s=15, zorder=4)` 画小黑点，不标注文字。
+- 画 sink/leaf node：
+  - 从 `leaf_info` 读取 sink 坐标和 sink_id。
+  - 用 `ax.scatter(..., marker="s", s=sink_marker_size, facecolors="royalblue", edgecolors="navy", ...)` 画蓝色方块。
+  - 每个方块旁用 `ax.text(x, y, sink_id, ...)` 标注 sink_id。
+- 画 source（root）：
+  - 用 `ax.scatter(..., marker="^", s=120, facecolors="red", edgecolors="darkred", ...)` 画红色三角。
+  - 旁注 "SRC" 文字标签。
 - 设置：
 
 ```python
@@ -397,8 +414,6 @@ ax.set_aspect("equal", adjustable="box")
 ax.grid(True, linewidth=0.5, alpha=0.4)
 ax.set_title("Tree on Die Grid")
 ```
-
-- 不要给点加文字 label。
 
 注意：这里的几何图只是 topology generation 的调试视图，不是最终 DME routing。edge 可以直接画 parent-child 直线，不需要画 Manhattan 折线。
 
@@ -433,7 +448,8 @@ sample_path = f"samples/sample{idx}.txt"
 
 ```python
 root, nodes, leaf_info, edges = parse_tree_file(tree_path)
-width, height = parse_die_size(sample_path)
+width, height, source_x, source_y = parse_sample_file(sample_path)
+source_pos = (source_x, source_y)
 ```
 
 之后计算并打印：
@@ -465,7 +481,7 @@ fig, (ax1, ax2) = plt.subplots(
 
 ```python
 draw_topology(ax1, root, nodes, leaf_info, edges)
-draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height)
+draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height, source_pos)
 ```
 
 8. 设置总标题：
@@ -496,8 +512,8 @@ python3 vtree.py 1
 
 应弹出一个 matplotlib 窗口；如果当前环境使用非交互 backend，则应保存图片到 `tree/sample1_vtree.png`：
 
-- 左侧：二叉树拓扑结构；圆片中 internal node 显示 node id，sink leaf 显示 sink id。
-- 右侧：die grid 上的 tree 几何连接；所有 edge 是粗黑线，所有 node/sink 是黑圆点，不显示文字。
+- 左侧：二叉树拓扑结构；圆片中 internal node 显示 node id，sink leaf 显示 sink id；root node（时钟源）用金色圆片和 "ROOT" 标注突出显示。
+- 右侧：die grid 上的 tree 几何连接；source 用红色三角形 "▲" 标注 "SRC"，sink 用蓝色方块 "■" 标注 sink_id（如 "L0"、"R3"），internal node 为小黑圆点无文字；所有 edge 为粗黑线。
 - 终端输出 `max_est_skew = ...`。
 - 非交互 backend 下终端额外输出 `saved visualization: tree/sample<k>_vtree.png`。
 - figure 总标题中显示 `max_est_skew=...`。
