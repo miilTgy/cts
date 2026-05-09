@@ -8,42 +8,40 @@ treer::TopologyTree tree = treer::build(problem, argv[1]);
 
 即可得到一棵二叉拓扑树。debug 开启时，还需要在 `./tree/` 目录下额外输出一个以输入文件名命名的树结构记录文件，方便后续写脚本可视化。
 
-# Topology Generation: Top-down MMM-style Recursive Geometric Bisection
+# Topology Generation: Plain RGM-style Recursive Geometric Matching
 
 ## 算法目标
 
-DME 后续会在给定 topology 上做 bottom-up merging segment、buffer insertion 和 top-down embedding。因此 `treer` 的职责不是在 topology 阶段追求 skew=0，而是优先生成 single-metal-friendly、planar-like、稳定可布线的二叉 slicing topology。
+DME 后续会在给定 topology 上做 bottom-up merging segment、buffer insertion 和 top-down embedding。因此 `treer` 的职责不是在 topology 阶段追求 skew=0，而是优先生成局部性好、少交叉、稳定可布线的二叉 topology。
 
-`treer` 使用类似 MMM（Method of Means and Medians）的 top-down recursive geometric bisection：
+`treer` 使用普通 RGM（Recursive Geometric Matching）风格的 bottom-up topology generation：
 
-- 对当前 sink set 计算 center of gravity，也就是 COG / mean，作为当前 abstract cluster center。
-- 根据当前 sink set 的 bbox 选择切分轴。
-- 按该轴排序，并用 median 附近的连续切分把 sink set 分成两个大小接近、几何上相邻的子集。
-- 对两个子集递归构造 left / right subtree。
-- 输出结构严格为二叉树，每个 internal node 恰好有两个 child。
+- 初始 active clusters 是所有 sink leaf。
+- 每一轮在 active clusters 上做 min-cost geometric matching。
+- 被匹配的两个 cluster 合并成一个 internal node。
+- 若 active cluster 数量为奇数，允许留下一个 unmatched cluster，直接 carry 到下一轮。
+- 重复直到只剩一个 cluster，作为 root。
 
 核心优先级：
 
 ```text
-合法可布线性 / planar-like topology > sink_count balance > wirelength heuristic > source/delay tie-break
+少交叉 / 局部相邻优先 > wirelength heuristic > tree balance
 ```
 
-不要为了 topology 阶段的估计 skew 破坏几何连续划分；后续 BU/TD/buffer 会负责 skew 修正。
-
-重要限制：普通 MMM 只保证 sink set 是连续几何划分，但如果 internal node 直接使用 COG，并用直线连接 parent COG 到 child COG，仍然可能在几何可视化上出现交叉。因此本 treer 采用 slicing-region-aware MMM：递归时同时维护每个 subtree 的 owned region，并把 internal node 的 abstract center 放在当前 split separator 附近，而不是无条件放在 sink set COG。这样生成的 abstract topology 更接近 H-tree / slicing tree，后续 TD 更容易布成无交叉 single-metal CTS。
+不要为了强制 balance 牺牲几何局部性。树稍微不平衡可以接受，因为后续 BU/TD/buffer 会负责 skew 修正；但 topology 如果一开始就大量交叉，后续 single-metal routing 很容易失败。
 
 ## 文件与 namespace 要求
 
 - 所有 topology generation 相关内容放在 `namespace treer` 中。
 - `treer.h`：声明对外 API。
-- `treer.cc`：实现 top-down MMM-style recursive geometric bisection 具体逻辑。
+- `treer.cc`：实现 RGM-style recursive geometric matching 具体逻辑。
 - `common.h`：放需要被其他模块使用的树节点/拓扑树数据结构。
 - 不要使用 `try / catch / exception` 作为主要错误处理方式，尽量使用 `if-else` 检查并返回 `valid=false` 和 `error_msg`。
 - 可使用 C++ 标准库的 `std::vector`、`std::string`、`std::limits`、`std::cmath`、`std::cerr` 等。
 
 ## 数据结构建议放在 `common.h`
 
-如果 `common.h` 已经有 `common::Problem`、`common::Sink`、`common::Point`，请在同一个 `namespace common` 中补充：
+如果 `common.h` 已经有 `common::Problem`、`common::Sink`、`common::Point`，请在同一个 `namespace common` 中补充或复用：
 
 ```cpp
 namespace common {
@@ -60,8 +58,8 @@ struct TreeNode {
 
     int sink_count = 0;
 
-    // Abstract cluster center used only for topology generation.
-    // DME top-down will decide the real embedding coordinate later.
+    // Abstract cluster center used only for topology generation/debug.
+    // It may be fractional. DME top-down will decide the real embedding coordinate later.
     double cx = 0.0;
     double cy = 0.0;
 
@@ -70,15 +68,16 @@ struct TreeNode {
     int bbox_ux = 0;
     int bbox_uy = 0;
 
-    // Optional slicing region owned by this subtree. Used by treer debug / heuristic only.
-    // It is not the final physical routing region and may be ignored by BU/TD.
+    // Region fields are optional for compatibility with old debug tools.
+    // RGM does not rely on slicing regions, so each node may store its subtree bbox
+    // or the whole die region here.
     int region_lx = 0;
     int region_ly = 0;
     int region_ux = 0;
     int region_uy = 0;
 
     // Estimated maximum downstream delay from this cluster root to its sinks.
-    // This is only a topology-generation heuristic, not final evaluator delay.
+    // This is only a topology-generation heuristic/debug value, not final evaluator delay.
     double est_delay = 0.0;
 };
 
@@ -144,12 +143,12 @@ TopologyTree build(const common::Problem& problem, const std::string& input_path
    - 如果 `problem.valid == false`，返回 `TopologyTree{.valid=false}`，并写入 error_msg。
    - 如果 sink 数量为 0，返回 invalid。
    - 如果 sink 数量为 1，生成只有一个 leaf node 的 tree，root 指向该 leaf，valid=true。
-   - 如果 sink 数量大于 1，使用 top-down MMM-style recursive geometric bisection 构造二叉树。
+   - 如果 sink 数量大于 1，使用 RGM-style recursive geometric matching 构造二叉树。
    - build 成功后，如果 debug 开启，调用 `debug_output(tree, problem)` 和 `debug_output_file(tree, problem, input_path)`。
 
-## Top-down MMM 主流程
+## RGM 主流程
 
-该算法是 top-down partitioning，不是 bottom-up clustering。
+该算法是 bottom-up matching，不是 top-down bisection。
 
 整体流程：
 
@@ -161,63 +160,258 @@ Output:
     common::TopologyTree tree
 
 build(problem):
-    create indices = [0, 1, ..., num_sinks-1]
-    root_region = whole die rectangle from problem
-    root_id = build_subtree(indices, root_region, problem, tree)
-    tree.root = root_id
+    active = []
+    for each sink:
+        leaf_id = create_leaf(sink)
+        active.push(leaf_id)
+
+    while active.size() > 1:
+        active = rgm_round(active, problem, tree)
+
+    tree.root = active[0]
+    tree.nodes[tree.root].parent = -1
     tree.valid = true
     return tree
 ```
 
-递归函数：
+一轮 RGM：
 
 ```text
-build_subtree(indices, region, problem, tree):
-    if indices.empty():
-        return invalid
+rgm_round(active, problem, tree):
+    pairs = enumerate all unordered pairs (active[i], active[j])
+    compute pair_cost for each pair
+    sort pairs by cost, then deterministic tie-break
 
-    if indices.size() == 1:
-        return create_leaf(indices[0], region, problem, tree)
+    used = empty set
+    selected_pairs = []
+    selected_segments = []
 
-    bbox = compute_bbox(indices)
-    cog  = compute_cog(indices)
+    for each pair in sorted pairs:
+        if either endpoint already used: continue
+        if pair segment conflicts with selected_segments: continue
+        if pair segment passes through forbidden sink/cluster center: continue
 
-    axis = choose_split_axis(region, bbox, indices, problem)
-    sorted = sort indices by axis, then by the other axis, then by sink_index
+        select this pair
+        mark both endpoints used
+        add pair segment to selected_segments
 
-    k = choose_best_median_split(sorted, axis, problem)
+    new_active = []
+    for each selected pair (a,b):
+        parent = create_internal_from_pair(a,b)
+        set nodes[a].parent = parent
+        set nodes[b].parent = parent
+        new_active.push(parent)
 
-    left_indices  = sorted[0:k]
-    right_indices = sorted[k:n]
+    for each active node not used:
+        new_active.push(active node)   // odd-node or blocked-node carry
 
-    split_coord = choose_split_coordinate(sorted, k, axis)
-    left_region, right_region = split_region(region, axis, split_coord)
+    if selected_pairs is empty:
+        fallback_select_one_best_pair_without_crossing_check(active)
+        // must guarantee progress
 
-    left_id  = build_subtree(left_indices, left_region, problem, tree)
-    right_id = build_subtree(right_indices, right_region, problem, tree)
-
-    abstract_center = choose_separator_center(region, axis, split_coord, bbox, cog)
-    parent_id = create_internal(left_id, right_id, bbox, region, abstract_center, tree)
-    tree.nodes[left_id].parent = parent_id
-    tree.nodes[right_id].parent = parent_id
-
-    return parent_id
+    return new_active
 ```
+
+要求：
+
+- 每轮必须保证 `new_active.size() < active.size()`，否则设置 error。
+- 正常情况下一个奇数 active node 会 carry 到下一轮。
+- 如果因为 crossing/obstacle 过滤导致多个 node unmatched，也允许 carry，但必须至少合并一对。
+- 不要强制每轮完美 matching；普通 RGM 可以有 unmatched carry。
+- 不要用 MMM 的 `choose_split_axis` / `sort by axis` / `median split` 作为主算法。
+
+## Active cluster 表示
+
+直接用 `tree.nodes[node_id]` 作为 active cluster。
+
+每个 cluster 的几何代表点是：
+
+```text
+center(node) = (node.cx, node.cy)
+```
+
+leaf center 是 sink 坐标。
+
+internal center 是两个 child 的 tapping point 近似位置。由于这里仅负责 topology，不需要求严格物理 tap point，允许使用小数坐标。
+
+每个 cluster 的 bbox 是所有 descendant sinks 的 bbox，用于 pair_cost 和 debug。
+
+## Tap point / internal center 规则
+
+RGM 课件里的 tapping point 是两个 subtree 连接边上使 skew 最小的点。这里不需要求最终真实物理位置，只需要一个 topology/debug 代表中心，因此用曼哈顿距离的一维参数来近似。
+
+设两个 child cluster 为 `a` 和 `b`：
+
+```text
+A = center(a) = (ax, ay)
+B = center(b) = (bx, by)
+dl = est_delay[a]
+dr = est_delay[b]
+D  = |ax - bx| + |ay - by|
+```
+
+如果 `D == 0`：
+
+```text
+tap = A
+parent.est_delay = max(dl, dr)
+```
+
+否则，理想 tap point 到 A 的曼哈顿距离为：
+
+```text
+t = (D + dr - dl) / 2
+```
+
+将 `t` clamp 到 `[0, D]`：
+
+```text
+t = clamp(t, 0, D)
+```
+
+然后只需生成一个抽象坐标，不要求真实 routing。为了 deterministic，沿一条固定 Manhattan path 从 A 走向 B：先走 x，再走 y。
+
+```text
+remaining = t
+sx = sign(bx - ax)
+sy = sign(by - ay)
+dx = |bx - ax|
+dy = |by - ay|
+
+if remaining <= dx:
+    tap.x = ax + sx * remaining
+    tap.y = ay
+else:
+    tap.x = bx
+    tap.y = ay + sy * (remaining - dx)
+```
+
+该 tap 坐标可以是 double。
+
+parent 的估计 delay：
+
+```text
+parent.est_delay = max(dl + t, dr + (D - t))
+```
+
+如果 `abs(dl - dr) <= D`，这个值等价于 `(dl + dr + D) / 2`。如果无法完全平衡，clamp 后会退化为更保守的一侧。
 
 注意：
 
-- `left_indices` 和 `right_indices` 必须是排序后数组的连续前缀 / 后缀。
-- 不允许用交错集合，例如 `{第1, 第3, 第5}` vs `{第2, 第4, 第6}`。
-- 这样生成的 topology 是 slicing-like 的，更适合 single-metal routing。
-- internal node 的 `cx/cy` 不是简单 COG，而是 slicing separator-aware abstract center，仅用于 topology debug 和 heuristic；DME TD 后续会决定真实 embedding coordinate。
-- 每个 subtree 维护一个 `region`。left/right region 由当前 split separator 切开，理论上互不重叠。debug 可视化时优先画 region-aware center，有助于观察 topology 是否接近无交叉 slicing tree。
+- treer 阶段不需要把 tap point 修到 grid integer。
+- treer 阶段不需要生成 parent-child route。
+- DME top-down 会在后续重新决定真实 embedding coordinate。
+- 这里的 `cx/cy` 只是 topology/debug/heuristic 的代表点。
 
-## leaf / internal node 创建规则
+## pair_cost 设计
 
-### create_leaf
+目标是优先局部连接、减少 topology 交叉，而不是强 balance。
+
+候选 pair `(a,b)` 的基础 cost：
 
 ```text
-create_leaf(sink_index, region):
+base_cost(a,b) =
+      1.0 * L1(center(a), center(b))
+    + 0.15 * bbox_hpwl(union_bbox(a,b))
+    + 0.05 * abs(est_delay[a] - est_delay[b])
+    + 0.001 * source_tie_break(a,b)
+```
+
+其中：
+
+```text
+L1(A,B) = |Ax-Bx| + |Ay-By|
+bbox_hpwl(box) = (box.ux - box.lx) + (box.uy - box.ly)
+source_tie_break(a,b) = L1(source, midpoint(center(a), center(b)))
+```
+
+解释：
+
+- L1 距离是主项，鼓励最近邻优先。
+- union bbox HPWL 鼓励合并紧凑 cluster，避免跨越式合并。
+- est_delay 差只是弱项，不要让它破坏几何局部性。
+- source tie-break 非常弱，只用于 deterministic 和轻微偏向。
+
+不要加入强 sink-count balance penalty。可以保留极弱项：
+
+```text
++ 0.0001 * abs(sink_count[a] - sink_count[b])
+```
+
+但不要让它影响局部几何匹配。
+
+## 非交叉优先规则
+
+RGM 每轮选择 pair 时，优先保证新选择的 pair segment 不与本轮已选择的 pair segment 交叉。
+
+定义候选 pair segment：
+
+```text
+segment(a,b) = straight line between center(a) and center(b)
+```
+
+用于 topology 交叉检查，不代表最终 routing。
+
+选择 pair 时：
+
+```text
+if segment(a,b) properly intersects any selected segment:
+    reject this pair
+```
+
+建议实现：
+
+- 使用 double 坐标做 2D orientation test。
+- proper intersection 指两个线段在内部相交。
+- 如果只是在端点接触，通常不算冲突。
+- 由于同一轮 selected pairs 没有共享 endpoint，所以端点接触极少发生。
+
+还要避免明显穿过已有 active cluster center：
+
+```text
+if segment(a,b) passes through center(c) for some active node c not equal a,b:
+    add huge penalty or reject
+```
+
+这里用近似判断即可：如果 `distance_point_to_segment(center(c), segment(a,b)) < eps` 且投影在线段内部，则认为穿过。
+
+优先策略：
+
+```text
+1. 先尝试不交叉、不穿 active center 的 pair。
+2. 如果这样导致本轮无法合并任何 pair，则 fallback 到 cost 最小的一对，保证算法前进。
+3. fallback 时仍应优先避开 active center；如果实在没有合法 pair，才允许纯 cost 最小 pair。
+```
+
+## 奇数 sinks / unmatched carry 规则
+
+普通 RGM 不要求每一轮所有 cluster 都被匹配。
+
+如果 `active.size()` 是奇数：
+
+```text
+本轮最多匹配 floor(active.size()/2) 对
+剩余 1 个 unmatched cluster carry 到下一轮
+```
+
+如果由于非交叉规则导致不止一个 unmatched，也允许：
+
+```text
+所有 unmatched active node 原样 push 到 new_active
+```
+
+但必须保证本轮至少有一个 pair 被合并。若没有 pair 被合并：
+
+```text
+选择 pair_cost 最小的一对强制合并
+```
+
+这样可以保证 while loop 终止。
+
+## create_leaf
+
+```text
+create_leaf(sink_index):
     node.id = tree.nodes.size()
     node.is_leaf = true
     node.sink_index = sink_index
@@ -228,270 +422,73 @@ create_leaf(sink_index, region):
     node.cx = sink[sink_index].loc.x
     node.cy = sink[sink_index].loc.y
     node.bbox = sink point itself
-    node.region = input region
+    node.region = whole die region or sink bbox
     node.est_delay = 0
     push node into tree.nodes
     return node.id
 ```
 
-### create_internal
+## create_internal_from_pair
 
 ```text
-create_internal(left_id, right_id, bbox, region, abstract_center):
+create_internal_from_pair(left_id, right_id):
+    left  = tree.nodes[left_id]
+    right = tree.nodes[right_id]
+
     p.id = tree.nodes.size()
     p.is_leaf = false
     p.sink_index = -1
     p.parent = -1
     p.left = left_id
     p.right = right_id
-    p.sink_count = nodes[left_id].sink_count + nodes[right_id].sink_count
-    p.cx = abstract_center.x
-    p.cy = abstract_center.y
-    p.bbox = bbox
-    p.region = region
+    p.sink_count = left.sink_count + right.sink_count
 
-    D  = manhattan(center(left), center(right))
-    dl = nodes[left_id].est_delay
-    dr = nodes[right_id].est_delay
-    p.est_delay = max(dl, dr) + max(0, (D - abs(dl - dr)) / 2)
+    p.bbox = union(left.bbox, right.bbox)
+    p.region = p.bbox or whole die region
+
+    tap = compute_tap_point_by_manhattan_distance(left, right)
+    p.cx = tap.x
+    p.cy = tap.y
+    p.est_delay = tap.parent_est_delay
 
     push p into tree.nodes
     return p.id
 ```
 
-## slicing region 与 abstract center 规则
-
-普通 MMM 会把 internal node 放在当前 sink set 的 COG。但是 COG 可能落在某个子区域内部，导致 parent-to-child 直线在 debug grid 上穿过其他 subtree，甚至形成交叉。因此这里使用 separator-aware abstract center。
-
-### region 定义
-
-每次递归调用拥有一个 axis-aligned rectangular region：
+为了输出 deterministic，可以在 pair `(a,b)` 内部固定 child 顺序：
 
 ```text
-Region = [lx, ly, ux, uy]
+if center(a).x < center(b).x: left=a,right=b
+else if center(a).x > center(b).x: left=b,right=a
+else if center(a).y < center(b).y: left=a,right=b
+else smaller node_id first
 ```
 
-root region 是 die rectangle。
+这只是树文件稳定性，不代表物理左右。
 
-当当前节点按 X 切分时：
+## 为什么不再使用 MMM / median split
+
+旧版 top-down MMM-style recursive geometric bisection 会先把 sink set 切成两个连续子集，再在每个子集中心附近创建 abstract center。它的优点是树高度稳定，但缺点是容易过早创建大 cluster center：
 
 ```text
-left_region  = [region.lx, region.ly, split_coord, region.uy]
-right_region = [split_coord, region.ly, region.ux, region.uy]
+先创建一个四点 cluster 的中心，再连接上下/左右子 cluster
 ```
 
-当当前节点按 Y 切分时：
+在一些布局中，这会导致 parent-to-child debug edge 或后续 L-shape route 穿越其他局部 cluster，产生交叉 topology。
+
+本版改用普通 RGM：
 
 ```text
-left_region  = [region.lx, region.ly, region.ux, split_coord]
-right_region = [region.lx, split_coord, region.ux, region.uy]
+先连接局部最近的 sink/cluster，再逐层合并
 ```
 
-这里的 left/right 只是排序后的前缀/后缀，不一定代表物理“左”和“右”；但 region 必须按切分轴连续划分。
-
-### split_coord
-
-对 sorted list 的切分位置 k：
+这样更容易得到：
 
 ```text
-last_left  = sorted[k-1]
-first_right = sorted[k]
+局部 pair -> 小 cluster -> 大 cluster
 ```
 
-若 axis == X：
-
-```text
-split_coord = floor((x[last_left] + x[first_right]) / 2)
-```
-
-若 axis == Y：
-
-```text
-split_coord = floor((y[last_left] + y[first_right]) / 2)
-```
-
-然后 clamp 到当前 region 内部：
-
-```text
-axis == X: split_coord in [region.lx, region.ux]
-axis == Y: split_coord in [region.ly, region.uy]
-```
-
-如果两个坐标相同，允许 split_coord 等于该坐标；region 可能零宽/零高，但递归仍通过 sink_count 下降终止。
-
-### choose_separator_center
-
-当前 internal node 的 abstract center 不直接使用 COG，而是放在 split separator 上：
-
-若 axis == X：
-
-```text
-cx = split_coord
-cy = clamp(cog.y, region.ly, region.uy)
-```
-
-若 axis == Y：
-
-```text
-cx = clamp(cog.x, region.lx, region.ux)
-cy = split_coord
-```
-
-这样 parent node 位于左右/上下子区域之间的 separator 附近，debug 连接线更像 slicing tree / H-tree，而不是任意 COG-to-COG 斜穿。
-
-### child center 建议
-
-leaf 的 `cx/cy` 仍然是 sink 坐标。
-
-internal child 的 `cx/cy` 由它自己的 split separator 决定。
-
-这并不能数学保证最终 TD 一定无交叉，因为最终 physical loc 仍由 BU/TD 决定；但它比普通 COG-MMM 更适合 single-metal-friendly topology。
-
-## 切分轴选择
-
-对当前 `indices` 计算 bbox，同时有当前递归的 owned region：
-
-```text
-width  = bbox_ux - bbox_lx
-height = bbox_uy - bbox_ly
-```
-
-region_width  = region.ux - region.lx  
-region_height = region.uy - region.ly
-
-默认：
-
-```text
-if region_width >= region_height:
-    axis = X
-else:
-    axis = Y
-```
-
-含义：
-
-- 区域更宽时，按 x 排序并左右切分。
-- 区域更高时，按 y 排序并上下切分。
-
-优先用 owned region 的长宽选择切分轴，而不是只用 sink bbox。这样递归区域会更像规范 slicing floorplan，减少 COG 连线交叉。若 region 退化为零宽/零高，再 fallback 到 sink bbox 的 width/height。
-
-如果 `width == 0 && height == 0`，说明所有点坐标完全重合，仍然可以按 `sink_index` 稳定切分。
-
-排序规则必须 deterministic：
-
-```text
-axis == X: sort by (x, y, sink_index)
-axis == Y: sort by (y, x, sink_index)
-```
-
-## median 附近 split 选择
-
-为了保证树高度稳定和左右 sink 数量均衡，不枚举所有 `k=1..n-1` 作为强 wirelength 优化，而是只枚举 median 附近的小窗口。
-
-推荐：
-
-```text
-n = sorted.size()
-mid = n / 2
-candidate_k = all k in [mid - 2, mid + 2] clipped to [1, n-1]
-```
-
-如果 n 很小，该规则自动退化为所有合法 k。
-
-对每个候选 k：
-
-```text
-left  = sorted[0:k]
-right = sorted[k:n]
-score = split_cost(left, right, axis, problem)
-```
-
-选择 score 最小的 k。若 score 相同，选择更接近 `mid` 的 k；若仍相同，选择更小的 k，保证 deterministic。
-
-## split_cost 设计
-
-第一版使用稳定、强 balance、弱 heuristic 的 cost：
-
-```text
-split_cost(left, right) =
-      A * abs(left_count - right_count)
-    + B * (bbox_hpwl(left) + bbox_hpwl(right))
-    + C * source_bias(left, right)
-    + D * est_delay_bias(left, right)
-```
-
-推荐默认权重：
-
-```text
-A = 1000000.0
-B = 1.0
-C = 0.05
-D = 0.01
-```
-
-解释：
-
-- `A` 非常大，强制优先保持左右 sink_count 接近，避免 topology 退化成长链。
-- `B` 鼓励子区域 bbox 紧凑，降低后续 wirelength。
-- `C` 是很弱的 source distance tie-break，避免 root 附近拓扑极端偏斜。
-- `D` 是极弱的 est_delay tie-break，不允许它破坏 median balance 和几何连续划分。
-
-其中：
-
-```text
-bbox_hpwl(S) = (bbox_ux(S) - bbox_lx(S)) + (bbox_uy(S) - bbox_ly(S))
-
-center(S) = COG(S)
-
-source_bias(left, right) =
-    abs(manhattan(source, center(left)) - manhattan(source, center(right)))
-```
-
-`est_delay_bias` 可以用子集合 bbox 粗略估计：
-
-```text
-est_delay_bias(left, right) = abs(estimate_subtree_delay(left) - estimate_subtree_delay(right))
-```
-
-为了简化，也允许第一版直接令：
-
-```text
-est_delay_bias = 0
-```
-
-重要：`split_cost` 只在 median 附近候选 k 中选择，不允许产生非连续划分。
-
-## 奇数 sink 数量处理
-
-MMM-style top-down bisection 天然支持奇数 sink 数量。
-
-例如 n = 15：
-
-```text
-mid = 7
-candidate k around 7
-最终可能切成 7/8 或 8/7
-```
-
-递归继续处理每个子集，直到每个 leaf 只包含一个 sink。
-
-不需要 unmatched carry-over，也不需要 active cluster pair matching。
-
-## 为什么不再使用 pair_cost / Greedy RGM
-
-旧版 Greedy RGM 的逻辑是从所有 active clusters 中反复选择一对 `pair_cost` 最小的 cluster 进行 bottom-up 合并。它容易生成几何上交错的拓扑，例如矩形四角点中错误地合并对角线 pair，导致后续 single-metal routing 出现交叉、物理 loop 或非法 CTS route。
-
-由于本作业中 routing 不合法会直接失败，而 topology 阶段的估计 skew 后续可以由 BU / TD / buffer 修正，因此 treer 不再使用全局 pair matching，也不再实现 `pair_cost()` 作为主算法。
-
-新的 top-down MMM 算法只允许连续几何划分：
-
-```text
-sorted by x or y
-left  = sorted[0:k]
-right = sorted[k:n]
-```
-
-这牺牲了一些 topology 阶段局部 wirelength 灵活性，但显著提高了 single-metal routing 的稳定性。
+例如左下角 4 个点会更倾向于先形成上面两点 pair、下面两点 pair，再把两个 pair 合并，而不是先在四点中间创建一个总 CG。
 
 ## est_delay 定义
 
@@ -503,44 +500,19 @@ leaf node：
 est_delay[leaf] = 0
 ```
 
-internal node 创建时使用 DME-like 的估计。设：
+internal node 使用 tap point 的曼哈顿距离参数估计：
 
 ```text
-D  = manhattan(center(left), center(right))
+D  = L1(center(left), center(right))
 dl = est_delay[left]
 dr = est_delay[right]
-```
-
-如果两边 delay 差可以通过几何距离调平：
-
-```text
-abs(dl - dr) <= D
-```
-
-则估计合并后的最大 delay 为：
-
-```text
-est_delay[parent] = (dl + dr + D) / 2.0
-```
-
-否则说明几何距离不足以补偿两边已有 delay 差，保守估计为：
-
-```text
-est_delay[parent] = max(dl, dr)
-```
-
-等价写法：
-
-```cpp
-double d = manhattan(left.cx, left.cy, right.cx, right.cy);
-double dl = left.est_delay;
-double dr = right.est_delay;
-parent.est_delay = std::max(dl, dr) + std::max(0.0, (d - std::abs(dl - dr)) / 2.0);
+t  = clamp((D + dr - dl) / 2, 0, D)
+est_delay[parent] = max(dl + t, dr + (D - t))
 ```
 
 ## 合法性与一致性检查
 
-在 `build()` 结束前可以做轻量检查：
+在 `build()` 结束前做轻量检查：
 
 - `tree.root >= 0`。
 - `tree.nodes[tree.root].parent == -1`。
@@ -548,12 +520,17 @@ parent.est_delay = std::max(dl, dr) + std::max(0.0, (d - std::abs(dl - dr)) / 2.
 - 每个 non-root node 的 parent 有效。
 - 每个 internal node 的 left/right 都有效且不同。
 - 每个 internal node 的 `sink_count = left.sink_count + right.sink_count`。
-- 每个 internal node 的 left/right 子树 sink set 不重叠，且 union 等于该 node 的 sink set。
-- 每次递归切分产生的 left/right 子集都非空。
-- 每个 node 的 region 合法：`region_lx <= region_ux` 且 `region_ly <= region_uy`。
-- 每个 internal node 的 left/right region 应来自该 node region 的一次 X 或 Y slicing split。
+- 每个 internal node 的 bbox 等于左右 child bbox 的 union。
+- 每个 sink 只出现在一个 leaf 中。
+- 从 root DFS 可以访问所有 node，且不存在 cycle。
 
-如果检查失败，设置 `tree.valid=false` 和清晰的 `error_msg`。
+RGM 不需要检查 slicing region，也不要求 child regions 来自一次 X/Y slicing split。请移除或禁用旧版 MMM 的 slicing-region validation，例如：
+
+```text
+child_regions_match_slicing(...)
+```
+
+否则 RGM 生成的合法 topology 会被错误判 invalid。
 
 ## Debug tree file 输出格式
 
@@ -599,8 +576,8 @@ EDGE <parent_id> <child_id>
 - `NODE` 行记录完整树节点信息。
 - `LEAF` 行方便可视化脚本直接找到 sink 坐标。
 - `EDGE` 行方便脚本直接画 parent-child 连线。
-- internal node 的真实物理坐标尚未由 DME top-down 决定，所以可视化时可以先用 `cx/cy` 作为 separator-aware MMM abstract center。
-- `region_*` 字段用于 debug slicing partition；可视化脚本可以画出每个 subtree 的 owned region，帮助检查交叉风险。
+- internal node 的真实物理坐标尚未由 DME top-down 决定，所以可视化时可以先用 `cx/cy` 作为 RGM tap/debug center。
+- RGM 允许 `cx/cy` 是小数，输出时不要强制转成 int。
 
 `debug_output_file()` 可以使用如下 helper：
 
