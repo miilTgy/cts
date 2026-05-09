@@ -9,7 +9,6 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace td {
@@ -53,8 +52,10 @@ static constexpr double SNAP_EPS = 1e-6;
 static constexpr double DELAY_EPS = 1e-6;
 static constexpr double INF = 1e100;
 static constexpr int MAX_CANDIDATES = 32;
-static constexpr double ROUTE_EXCESS_WEIGHT = 10.0;
-static constexpr double BEND_WEIGHT = 0.01;
+static constexpr double LSHAPE_EXCESS_COST = 10000.0;
+static constexpr double LSHAPE_BEND_COST = 100.0;
+static constexpr double LSHAPE_LEN_COST = 1.0;
+static constexpr double LSHAPE_DIST_COST = 0.001;
 
 static double to_u(double x, double y) {
     return x + y;
@@ -481,49 +482,6 @@ static std::vector<common::SegmentPoint> generate_candidate_locs(
     return points;
 }
 
-static long long coord_key(double v) {
-    return static_cast<long long>(std::llround(v * 1000000.0));
-}
-
-static std::string point_key(const common::SegmentPoint& p) {
-    return std::to_string(coord_key(p.x)) + "," + std::to_string(coord_key(p.y));
-}
-
-static bool point_is_forbidden_sink(const common::SegmentPoint& p,
-                                    const std::vector<common::Sink>& sinks,
-                                    int allowed_parent_sink,
-                                    int allowed_child_sink) {
-    for (std::size_t i = 0; i < sinks.size(); ++i) {
-        if (!is_allowed_sink_index(static_cast<int>(i), allowed_parent_sink,
-                                   allowed_child_sink) &&
-            point_equals_sink(p, sinks[i])) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static int add_vertex(std::vector<common::SegmentPoint>& vertices,
-                      std::unordered_map<std::string, int>& id_by_key,
-                      const common::SegmentPoint& p,
-                      const std::vector<common::Sink>& sinks,
-                      int allowed_parent_sink,
-                      int allowed_child_sink) {
-    if (!is_finite_point(p) ||
-        point_is_forbidden_sink(p, sinks, allowed_parent_sink, allowed_child_sink)) {
-        return -1;
-    }
-    const std::string key = point_key(p);
-    const auto it = id_by_key.find(key);
-    if (it != id_by_key.end()) {
-        return it->second;
-    }
-    const int id = static_cast<int>(vertices.size());
-    vertices.push_back(p);
-    id_by_key[key] = id;
-    return id;
-}
-
 static RouteCandidate route_to_best_candidate_loc_dag(
     const common::SegmentPoint& parent_loc,
     const std::vector<common::SegmentPoint>& candidate_locs,
@@ -531,248 +489,211 @@ static RouteCandidate route_to_best_candidate_loc_dag(
     int allowed_parent_sink,
     int allowed_child_sink,
     double assigned_edge,
-    const common::MergingSegment& child_ms,
     std::string& err) {
     RouteCandidate best;
     if (candidate_locs.empty()) {
-        err = "TD has no candidate locations for obstacle-aware route";
+        err = "TD has no candidate locations for L-shape route";
         return best;
     }
 
-    std::vector<double> x_coords;
-    std::vector<double> y_coords;
-    x_coords.push_back(parent_loc.x);
-    y_coords.push_back(parent_loc.y);
-    for (const common::SegmentPoint& loc : candidate_locs) {
-        x_coords.push_back(loc.x);
-        y_coords.push_back(loc.y);
-    }
-    for (const common::Sink& sink : sinks) {
-        x_coords.push_back(sink.loc.x - 1.0);
-        x_coords.push_back(sink.loc.x);
-        x_coords.push_back(sink.loc.x + 1.0);
-        y_coords.push_back(sink.loc.y - 1.0);
-        y_coords.push_back(sink.loc.y);
-        y_coords.push_back(sink.loc.y + 1.0);
-    }
+    for (const common::SegmentPoint& T : candidate_locs) {
+        std::vector<std::vector<common::SegmentPoint>> paths;
 
-    auto sort_unique = [](std::vector<double>& values) {
-        std::sort(values.begin(), values.end());
-        std::vector<double> out;
-        for (double v : values) {
-            if (out.empty() || !near(out.back(), v)) {
-                out.push_back(v);
-            }
-        }
-        values.swap(out);
-    };
-    sort_unique(x_coords);
-    sort_unique(y_coords);
-
-    std::vector<common::SegmentPoint> vertices;
-    std::unordered_map<std::string, int> id_by_key;
-    const int start_id = add_vertex(vertices, id_by_key, parent_loc, sinks,
-                                    allowed_parent_sink, allowed_child_sink);
-    if (start_id < 0) {
-        err = "TD parent location is a forbidden sink obstacle";
-        return best;
-    }
-
-    std::vector<int> target_ids;
-    for (const common::SegmentPoint& loc : candidate_locs) {
-        const int id = add_vertex(vertices, id_by_key, loc, sinks,
-                                  allowed_parent_sink, allowed_child_sink);
-        if (id >= 0) {
-            target_ids.push_back(id);
-        }
-    }
-    if (target_ids.empty()) {
-        err = "TD all candidate locations are forbidden sink obstacles";
-        return best;
-    }
-
-    for (double x : x_coords) {
-        for (double y : y_coords) {
-            add_vertex(vertices, id_by_key, common::SegmentPoint{x, y}, sinks,
-                       allowed_parent_sink, allowed_child_sink);
-        }
-    }
-
-    // Group vertices by row/col for connectivity
-    std::map<long long, std::vector<int>> rows;
-    std::map<long long, std::vector<int>> cols;
-    for (int i = 0; i < static_cast<int>(vertices.size()); ++i) {
-        rows[coord_key(vertices[static_cast<std::size_t>(i)].y)].push_back(i);
-        cols[coord_key(vertices[static_cast<std::size_t>(i)].x)].push_back(i);
-    }
-
-    // Compute topo_order for DAG routing
-    std::vector<double> topo_order(vertices.size(), INF);
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
-        double min_val = INF;
-        for (int t : target_ids) {
-            const double val = manhattan(vertices[static_cast<std::size_t>(start_id)], vertices[i]) +
-                               1e-6 * manhattan(vertices[i], vertices[static_cast<std::size_t>(t)]);
-            if (val < min_val) min_val = val;
-        }
-        topo_order[i] = min_val;
-    }
-
-    // Phase 1: DAG shortest path DP
-    std::vector<double> dag_dist(vertices.size(), INF);
-    std::vector<int> dag_prev(vertices.size(), -1);
-    dag_dist[static_cast<std::size_t>(start_id)] = 0.0;
-
-    std::vector<std::vector<std::pair<int, double>>> dag_adj(vertices.size());
-    auto connect_dag = [&](std::vector<int> ids, bool sort_by_x) {
-        std::sort(ids.begin(), ids.end(), [&](int a, int b) {
-            return sort_by_x ? vertices[a].x < vertices[b].x
-                             : vertices[a].y < vertices[b].y;
-        });
-        for (std::size_t i = 1; i < ids.size(); ++i) {
-            const int a = ids[i - 1U];
-            const int b = ids[i];
-            if (same_point(vertices[a], vertices[b])) continue;
-            if (segment_crosses_forbidden_sink(vertices[a], vertices[b], sinks,
-                                                allowed_parent_sink, allowed_child_sink))
-                continue;
-            const double len = manhattan(vertices[a], vertices[b]);
-            if (topo_order[static_cast<std::size_t>(a)] + SNAP_EPS <
-                topo_order[static_cast<std::size_t>(b)])
-                dag_adj[static_cast<std::size_t>(a)].push_back({b, len});
-            if (topo_order[static_cast<std::size_t>(b)] + SNAP_EPS <
-                topo_order[static_cast<std::size_t>(a)])
-                dag_adj[static_cast<std::size_t>(b)].push_back({a, len});
-        }
-    };
-
-    for (auto& entry : rows) connect_dag(entry.second, true);
-    for (auto& entry : cols) connect_dag(entry.second, false);
-
-    // DP in topo_order
-    std::vector<std::size_t> sorted_idx(vertices.size());
-    for (std::size_t i = 0; i < vertices.size(); ++i) sorted_idx[i] = i;
-    std::sort(sorted_idx.begin(), sorted_idx.end(), [&](std::size_t a, std::size_t b) {
-        return topo_order[a] < topo_order[b];
-    });
-
-    for (std::size_t idx : sorted_idx) {
-        if (dag_dist[idx] >= INF / 2.0) continue;
-        for (const auto& edge : dag_adj[idx]) {
-            const int v = edge.first;
-            const double nd = dag_dist[idx] + edge.second;
-            if (nd + SNAP_EPS < dag_dist[static_cast<std::size_t>(v)]) {
-                dag_dist[static_cast<std::size_t>(v)] = nd;
-                dag_prev[static_cast<std::size_t>(v)] = static_cast<int>(idx);
-            }
-        }
-    }
-
-    // Check if any target reachable via DAG
-    bool dag_found = false;
-    for (int t : target_ids) {
-        if (dag_dist[static_cast<std::size_t>(t)] < INF / 2.0) {
-            dag_found = true;
-            break;
-        }
-    }
-
-    std::vector<double> dist;
-    std::vector<int> prev;
-    if (dag_found) {
-        dist = std::move(dag_dist);
-        prev = std::move(dag_prev);
-    } else {
-        // Phase 2: Fallback to undirected visibility graph + Dijkstra
-        dist.assign(vertices.size(), INF);
-        prev.assign(vertices.size(), -1);
-        std::vector<std::vector<std::pair<int, double>>> adj(vertices.size());
-        auto connect_group = [&](std::vector<int> ids, bool sort_by_x) {
-            std::sort(ids.begin(), ids.end(), [&](int a, int b) {
-                return sort_by_x ? vertices[a].x < vertices[b].x
-                                 : vertices[a].y < vertices[b].y;
-            });
-            for (std::size_t i = 1U; i < ids.size(); ++i) {
-                const int a = ids[i - 1U];
-                const int b = ids[i];
-                if (same_point(vertices[a], vertices[b])) continue;
-                if (segment_crosses_forbidden_sink(vertices[a], vertices[b], sinks,
-                                                    allowed_parent_sink,
-                                                    allowed_child_sink))
+        if (near(parent_loc.x, T.x) || near(parent_loc.y, T.y)) {
+            paths.push_back({parent_loc, T});
+        } else {
+            paths.push_back({parent_loc,
+                             common::SegmentPoint{T.x, parent_loc.y},
+                             T});
+            paths.push_back({parent_loc,
+                             common::SegmentPoint{parent_loc.x, T.y},
+                             T});
+            for (const common::Sink& sink : sinks) {
+                if (is_allowed_sink_index(static_cast<int>(&sink - sinks.data()),
+                                           allowed_parent_sink, allowed_child_sink))
                     continue;
-                const double len = manhattan(vertices[a], vertices[b]);
-                adj[static_cast<std::size_t>(a)].push_back({b, len});
-                adj[static_cast<std::size_t>(b)].push_back({a, len});
-            }
-        };
-        for (auto& entry : rows) connect_group(entry.second, true);
-        for (auto& entry : cols) connect_group(entry.second, false);
-
-        using QueueItem = std::pair<double, int>;
-        std::priority_queue<QueueItem, std::vector<QueueItem>,
-                            std::greater<QueueItem>> pq;
-        dist[static_cast<std::size_t>(start_id)] = 0.0;
-        pq.push({0.0, start_id});
-        while (!pq.empty()) {
-            const QueueItem item = pq.top();
-            pq.pop();
-            const double d = item.first;
-            const int u = item.second;
-            if (d > dist[static_cast<std::size_t>(u)] + SNAP_EPS) continue;
-            for (const auto& edge : adj[static_cast<std::size_t>(u)]) {
-                const int v = edge.first;
-                const double nd = d + edge.second;
-                if (nd + SNAP_EPS < dist[static_cast<std::size_t>(v)]) {
-                    dist[static_cast<std::size_t>(v)] = nd;
-                    prev[static_cast<std::size_t>(v)] = u;
-                    pq.push({nd, v});
-                }
+                paths.push_back({parent_loc,
+                                 common::SegmentPoint{sink.loc.x - 1.0, parent_loc.y},
+                                 T});
+                paths.push_back({parent_loc,
+                                 common::SegmentPoint{sink.loc.x + 1.0, parent_loc.y},
+                                 T});
+                paths.push_back({parent_loc,
+                                 common::SegmentPoint{parent_loc.x, sink.loc.y - 1.0},
+                                 T});
+                paths.push_back({parent_loc,
+                                 common::SegmentPoint{parent_loc.x, sink.loc.y + 1.0},
+                                 T});
             }
         }
-    }
 
-    // Extract best candidate path (shared between DAG and Dijkstra)
-    int best_target = -1;
-    for (int target_id : target_ids) {
-        const double d = dist[static_cast<std::size_t>(target_id)];
-        if (!std::isfinite(d) || d >= INF / 2.0) continue;
-        std::vector<common::SegmentPoint> path;
-        for (int cur = target_id; cur >= 0; cur = prev[static_cast<std::size_t>(cur)]) {
-            path.push_back(vertices[static_cast<std::size_t>(cur)]);
-            if (cur == start_id) break;
-        }
-        if (path.empty() || !same_point(path.back(), parent_loc)) continue;
-        std::reverse(path.begin(), path.end());
-        path = simplify_polyline(path);
-        if (path.size() == 1U &&
-            same_point(path.front(), vertices[static_cast<std::size_t>(target_id)])) {
-            path.push_back(vertices[static_cast<std::size_t>(target_id)]);
-        }
-        if (polyline_crosses_forbidden_sink(path, sinks, allowed_parent_sink,
-                                             allowed_child_sink))
-            continue;
-        const double len = polyline_length(path);
-        const double cost = len +
-                            ROUTE_EXCESS_WEIGHT * std::max(0.0, len - assigned_edge) +
-                            BEND_WEIGHT * bend_count(path) +
-                            0.001 * manhattan(vertices[static_cast<std::size_t>(target_id)],
-                                              midpoint_of_ms(child_ms));
-        if (!best.valid || cost < best.cost - SNAP_EPS) {
-            best.valid = true;
-            best_target = target_id;
-            best.loc = vertices[static_cast<std::size_t>(target_id)];
-            best.path = path;
-            best.geo = manhattan(parent_loc, best.loc);
-            best.routed_len = len;
-            best.cost = cost;
+        for (auto& path : paths) {
+            path = simplify_polyline(path);
+            if (path.size() < 2U) continue;
+            if (polyline_crosses_forbidden_sink(path, sinks,
+                                                 allowed_parent_sink,
+                                                 allowed_child_sink))
+                continue;
+            const double len = polyline_length(path);
+            const double cost =
+                LSHAPE_EXCESS_COST * std::max(0.0, len - assigned_edge) +
+                LSHAPE_BEND_COST * bend_count(path) +
+                LSHAPE_LEN_COST * len +
+                LSHAPE_DIST_COST * manhattan(parent_loc, T);
+            if (!best.valid || cost < best.cost - SNAP_EPS) {
+                best.valid = true;
+                best.loc = T;
+                best.path = path;
+                best.geo = manhattan(parent_loc, T);
+                best.routed_len = len;
+                best.cost = cost;
+            }
         }
     }
 
     if (!best.valid) {
-        err = "TD obstacle-aware route search found no legal path";
-        return best;
+        // Fallback: undirected visibility graph + Dijkstra on candidate grid
+        std::vector<common::SegmentPoint> vertices;
+        std::unordered_map<std::string, int> id_by_key;
+
+        auto fallback_add_vertex = [&](const common::SegmentPoint& p) -> int {
+            if (!is_finite_point(p)) return -1;
+            for (std::size_t i = 0; i < sinks.size(); ++i) {
+                if (!is_allowed_sink_index(static_cast<int>(i), allowed_parent_sink,
+                                            allowed_child_sink) &&
+                    point_equals_sink(p, sinks[i]))
+                    return -1;
+            }
+            auto key = std::to_string(static_cast<long long>(std::llround(p.x * 1e6))) +
+                       "," + std::to_string(static_cast<long long>(std::llround(p.y * 1e6)));
+            auto it = id_by_key.find(key);
+            if (it != id_by_key.end()) return it->second;
+            int id = static_cast<int>(vertices.size());
+            vertices.push_back(p);
+            id_by_key[key] = id;
+            return id;
+        };
+
+        // Build x/y coords from parent, candidates, and sink ±1 corridors
+        std::vector<double> x_coords, y_coords;
+        x_coords.push_back(parent_loc.x);
+        y_coords.push_back(parent_loc.y);
+        for (const auto& loc : candidate_locs) {
+            x_coords.push_back(loc.x);
+            y_coords.push_back(loc.y);
+        }
+        for (const common::Sink& sink : sinks) {
+            if (is_allowed_sink_index(static_cast<int>(&sink - sinks.data()),
+                                       allowed_parent_sink, allowed_child_sink))
+                continue;
+            x_coords.push_back(sink.loc.x - 1.0);
+            x_coords.push_back(sink.loc.x + 1.0);
+            y_coords.push_back(sink.loc.y - 1.0);
+            y_coords.push_back(sink.loc.y + 1.0);
+        }
+        // Deduplicate
+        auto sort_unique = [](std::vector<double>& values) {
+            std::sort(values.begin(), values.end());
+            std::vector<double> out;
+            for (double v : values) {
+                if (out.empty() || !near(out.back(), v)) out.push_back(v);
+            }
+            values.swap(out);
+        };
+        sort_unique(x_coords);
+        sort_unique(y_coords);
+
+        int start_id = fallback_add_vertex(parent_loc);
+        std::vector<int> target_ids;
+        for (const auto& loc : candidate_locs) {
+            int id = fallback_add_vertex(loc);
+            if (id >= 0) target_ids.push_back(id);
+        }
+        if (start_id >= 0 && !target_ids.empty()) {
+            for (double x : x_coords)
+                for (double y : y_coords)
+                    fallback_add_vertex(common::SegmentPoint{x, y});
+
+            std::vector<std::vector<std::pair<int, double>>> adj(vertices.size());
+            long long key_scale = 1000000;
+            std::map<long long, std::vector<int>> rows, cols;
+            for (int i = 0; i < static_cast<int>(vertices.size()); ++i) {
+                rows[static_cast<long long>(std::llround(vertices[i].y * key_scale))].push_back(i);
+                cols[static_cast<long long>(std::llround(vertices[i].x * key_scale))].push_back(i);
+            }
+            auto connect_fb = [&](std::vector<int> ids, bool sort_by_x) {
+                std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+                    return sort_by_x ? vertices[a].x < vertices[b].x
+                                     : vertices[a].y < vertices[b].y;
+                });
+                for (std::size_t i = 1; i < ids.size(); ++i) {
+                    int a = ids[i - 1], b = ids[i];
+                    if (same_point(vertices[a], vertices[b])) continue;
+                    if (segment_crosses_forbidden_sink(vertices[a], vertices[b], sinks,
+                                                        allowed_parent_sink, allowed_child_sink))
+                        continue;
+                    double len = manhattan(vertices[a], vertices[b]);
+                    adj[a].push_back({b, len});
+                    adj[b].push_back({a, len});
+                }
+            };
+            for (auto& e : rows) connect_fb(e.second, true);
+            for (auto& e : cols) connect_fb(e.second, false);
+
+            std::vector<double> fb_dist(vertices.size(), INF);
+            std::vector<int> fb_prev(vertices.size(), -1);
+            fb_dist[start_id] = 0.0;
+            using QI = std::pair<double, int>;
+            std::priority_queue<QI, std::vector<QI>, std::greater<QI>> pq;
+            pq.push({0.0, start_id});
+            while (!pq.empty()) {
+                auto item = pq.top(); pq.pop();
+                if (item.first > fb_dist[item.second] + SNAP_EPS) continue;
+                for (auto& edge : adj[item.second]) {
+                    double nd = item.first + edge.second;
+                    if (nd + SNAP_EPS < fb_dist[edge.first]) {
+                        fb_dist[edge.first] = nd;
+                        fb_prev[edge.first] = item.second;
+                        pq.push({nd, edge.first});
+                    }
+                }
+            }
+            for (int tid : target_ids) {
+                if (fb_dist[tid] >= INF / 2.0) continue;
+                std::vector<common::SegmentPoint> path;
+                for (int cur = tid; cur >= 0; cur = fb_prev[cur]) {
+                    path.push_back(vertices[cur]);
+                    if (cur == start_id) break;
+                }
+                if (path.empty() || !same_point(path.back(), parent_loc)) continue;
+                std::reverse(path.begin(), path.end());
+                path = simplify_polyline(path);
+                if (path.size() == 1U && same_point(path.front(), vertices[tid]))
+                    path.push_back(vertices[tid]);
+                if (polyline_crosses_forbidden_sink(path, sinks, allowed_parent_sink,
+                                                     allowed_child_sink))
+                    continue;
+                double len = polyline_length(path);
+                double cost = LSHAPE_EXCESS_COST * std::max(0.0, len - assigned_edge) +
+                              LSHAPE_BEND_COST * bend_count(path) +
+                              LSHAPE_LEN_COST * len +
+                              LSHAPE_DIST_COST * manhattan(parent_loc, vertices[tid]);
+                if (!best.valid || cost < best.cost - SNAP_EPS) {
+                    best.valid = true;
+                    best.loc = vertices[tid];
+                    best.path = path;
+                    best.geo = manhattan(parent_loc, best.loc);
+                    best.routed_len = len;
+                    best.cost = cost;
+                }
+            }
+        }
+
+        if (!best.valid) {
+            err = "no legal L-shape route from parent to any child candidate";
+            return best;
+        }
     }
-    (void)best_target;
     return best;
 }
 
@@ -1018,7 +939,6 @@ static BranchCandidate build_branch_candidate(
                                                    branch.allowed_parent_sink,
                                                    branch.allowed_child_sink,
                                                    branch.assigned_edge,
-                                                   child_bu.ms,
                                                    err);
     if (!branch.route.valid) {
         err = "TD cannot route child " + std::to_string(child_id) + ": " + err;
@@ -1145,19 +1065,20 @@ static bool write_branch_result(int parent_id,
 
 static bool place_sibling_pair_with_balancing(
     int parent_id,
+    int left_id,
+    int right_id,
     const common::Problem& problem,
     const common::TopologyTree& tree,
     const common::BottomUpResult& bu_result,
     common::TopDownResult& result,
     std::string& err) {
-    const common::TreeNode& parent = tree.nodes[static_cast<std::size_t>(parent_id)];
-    BranchCandidate left = build_branch_candidate(parent_id, parent.left, true,
+    BranchCandidate left = build_branch_candidate(parent_id, left_id, true,
                                                   problem, tree, bu_result,
                                                   result, err);
     if (!left.route.valid) {
         return false;
     }
-    BranchCandidate right = build_branch_candidate(parent_id, parent.right, false,
+    BranchCandidate right = build_branch_candidate(parent_id, right_id, false,
                                                    problem, tree, bu_result,
                                                    result, err);
     if (!right.route.valid) {
@@ -1165,12 +1086,12 @@ static bool place_sibling_pair_with_balancing(
     }
 
     const double left_child_extra =
-        result.node_results[static_cast<std::size_t>(parent.left)].valid
-            ? result.node_results[static_cast<std::size_t>(parent.left)].td_common_extra_delay
+        result.node_results[static_cast<std::size_t>(left_id)].valid
+            ? result.node_results[static_cast<std::size_t>(left_id)].td_common_extra_delay
             : 0.0;
     const double right_child_extra =
-        result.node_results[static_cast<std::size_t>(parent.right)].valid
-            ? result.node_results[static_cast<std::size_t>(parent.right)].td_common_extra_delay
+        result.node_results[static_cast<std::size_t>(right_id)].valid
+            ? result.node_results[static_cast<std::size_t>(right_id)].td_common_extra_delay
             : 0.0;
     const double common_extra = std::max(left_child_extra + left.route_excess,
                                          right_child_extra + right.route_excess);
@@ -1182,9 +1103,9 @@ static bool place_sibling_pair_with_balancing(
         return false;
     }
     const common::TopDownNodeResult& left_td =
-        result.node_results[static_cast<std::size_t>(parent.left)];
+        result.node_results[static_cast<std::size_t>(left_id)];
     const common::TopDownNodeResult& right_td =
-        result.node_results[static_cast<std::size_t>(parent.right)];
+        result.node_results[static_cast<std::size_t>(right_id)];
     const double left_extra = left_td.td_common_extra_delay +
                               left_td.final_length_to_parent -
                               left.assigned_edge;
@@ -1202,8 +1123,8 @@ static bool place_sibling_pair_with_balancing(
 
     if (g_debug_enabled) {
         std::cout << "[TD_PAIR] parent=" << parent_id
-                  << " left=" << parent.left
-                  << " right=" << parent.right << "\n";
+                  << " left=" << left_id
+                  << " right=" << right_id << "\n";
         std::cout << "[TD_PAIR]   left selected=(" << left.route.loc.x << ","
                   << left.route.loc.y << ") assigned=" << left.assigned_edge
                   << " routed=" << left.route.routed_len
@@ -1293,13 +1214,13 @@ static bool place_node_recursive(int node_id,
     }
     const common::TreeNode& node = tree.nodes[idx];
     if (!node.is_leaf) {
-        if (!place_sibling_pair_with_balancing(node_id, problem, tree, bu_result,
+        if (!place_sibling_pair_with_balancing(node_id, node.left, node.right, problem, tree, bu_result,
                                                result, err) ||
             !place_node_recursive(node.left, problem, tree, bu_result, result,
                                   state, err) ||
             !place_node_recursive(node.right, problem, tree, bu_result, result,
                                   state, err) ||
-            !place_sibling_pair_with_balancing(node_id, problem, tree, bu_result,
+            !place_sibling_pair_with_balancing(node_id, node.left, node.right, problem, tree, bu_result,
                                                result, err)) {
             return false;
         }

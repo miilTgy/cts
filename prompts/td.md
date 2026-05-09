@@ -158,9 +158,11 @@ keep at most K candidates, e.g. K=16 or 32
 
 说明：sink 周围的 `±1` corridor 点是为了让 route DAG 更容易选择绕开 sink 的终点位置；DME 允许 `loc` 是 `ms(c) ∩ TRR(parent)` 中任意点，所以这里应把 location selection 和 routing legality 联合优化。
 
-## 5. Candidate-loc DAG route
+## 5. Candidate-loc L-shape route
 
-实现一个局部 routing DAG，把所有 candidate loc 作为可选终点：
+本阶段先不要实现 full visibility graph / 多拐点 DAG。为避免产生很多无意义拐弯，TD route 只允许从 parent loc 到 child candidate loc 的 L-shape 搜索空间。
+
+实现函数名可以暂时保留 `route_to_best_candidate_loc_dag()`，但语义改为：对每个 candidate loc 枚举 1 或 2 条 L-shape，并在所有合法 L-shape 中选择 cost 最小者。
 
 ```cpp
 struct RouteCandidate {
@@ -193,66 +195,86 @@ allowed_child_sink  = child  is leaf ? child.sink_index  : -1
 
 Horizontal/vertical segment 若经过 forbidden sink，则非法。判断包含端点；如果 internal location 落在 forbidden sink 上，也非法。
 
-### 5.2 构建 DAG 顶点
+### 5.2 L-shape 搜索空间
 
-令 `A = parent_loc`，终点集合为 `T = candidate_locs`。
+令 `A = parent_loc`，某个候选 child 位置为 `T`。
 
-```text
-x_coords = {A.x} ∪ {t.x for t in T}
-y_coords = {A.y} ∪ {t.y for t in T}
-for each forbidden sink o:
-    x_coords add o.x - 1, o.x, o.x + 1
-    y_coords add o.y - 1, o.y, o.y + 1
-
-vertices = {A} ∪ T ∪ cartesian product(x_coords, y_coords)
-remove vertices that equal forbidden sink
-```
-
-### 5.3 构建 DAG 边
-
-对任意两个 vertex `u,v`：
+对每个 `T` 枚举 L-shape path：
 
 ```text
-if u.x == v.x or u.y == v.y:
-    if segment(u,v) does not cross forbidden sink:
-        allow edge only if topo_order(u) < topo_order(v)
+HV: A -> (T.x, A.y) -> T
+VH: A -> (A.x, T.y) -> T
 ```
+
+如果 `A.x == T.x` 或 `A.y == T.y`，说明 parent 和 child candidate 已经水平或垂直对齐，此时搜索空间只有一条直线路径：
+
+```text
+A -> T
+```
+
+要求：
+
+- 不构建 `x_coords × y_coords` 的 full visibility graph。
+- 不使用 `sink.x±1` / `sink.y±1` corridor 作为中间转折点。
+- 不生成超过 1 个 bend 的 route。
+- 对齐时不要保留重复中间点，例如不要输出 `A -> A -> T` 或 `A -> T -> T`。
+- 每条候选 path 生成后调用 `simplify_polyline()` 去掉重复点和共线中间点，但不能改变 route 的几何形状。
+- 只接受 `polyline_crosses_forbidden_sink(path, ...) == false` 的候选路径。
+
+伪代码：
+
+```text
+best = invalid
+for each candidate T in candidate_locs:
+    paths = []
+
+    if A.x == T.x or A.y == T.y:
+        paths.push([A, T])
+    else:
+        paths.push([A, (T.x, A.y), T])  // HV
+        paths.push([A, (A.x, T.y), T])  // VH
+
+    for each path in paths:
+        path = simplify_polyline(path)
+        if path invalid rectilinear: continue
+        if path crosses forbidden sink: continue
+        routed_len = polyline_length(path)
+        geo = L1(A, T)
+        cost = route_cost(path, T)
+        update best
+
+if no legal L-shape exists:
+    err = "no legal L-shape route from parent to any child candidate"
+    return invalid
+return best
+```
+
+### 5.3 cost
+
+因为只允许 L-shape，`routed_len == L1(A,T)`。cost 仍然需要偏好：
+
+1. 不超过 BU assigned edge；
+2. 少拐弯；
+3. route 短；
+4. candidate loc 尽量靠近 parent，作为稳定 tie-break。
 
 推荐：
 
 ```text
-topo_order(p) = min_{t in T} (L1(A,p) + 1e-6 * L1(p,t))
+route_cost(path, T) =
+    10000.0 * max(0, routed_len - assigned_edge)
+  +   100.0 * bend_count(path)
+  +     1.0 * routed_len
+  +     0.001 * L1(parent_loc, T)
 ```
 
-如果 DAG 因 order 太严格找不到路径，fallback 到 undirected visibility graph + Dijkstra；但函数名和主逻辑仍保留 DAG augmentation 语义。
-
-### 5.4 搜索和 cost
-
-在 DAG 上做 shortest path DP，或 fallback Dijkstra。目标是从 `A` 到任一 `t ∈ T`：
-
-```text
-route_cost(path, t) =
-    routed_len(path)
-  + alpha * max(0, routed_len(path) - assigned_edge)
-  + beta  * bend_count(path)
-  + gamma * L1(t, midpoint(child_ms))
-```
-
-建议默认：
-
-```text
-alpha = 10.0   // 避免过多超过 BU edge，降低后续 compensation
-beta  = 0.01   // 少拐弯
- gamma = 0.001  // loc 尽量靠近 ms 中心
-```
-
-如果不想把 `child_ms` 传入 route 函数，则 `gamma` 项可在外部算，或者设为 0。
+由于目前只允许直线或 L-shape，`bend_count(path)` 只可能是 0 或 1。
 
 输出：
 
 ```text
 best.loc = selected endpoint candidate
-best.path = simplify_polyline(shortest path)
+best.path = selected legal L-shape path
 best.geo = L1(A, best.loc)
 best.routed_len = polyline_length(best.path)
 best.cost = route_cost
@@ -264,6 +286,7 @@ best.cost = route_cost
 - `best.path.back()==best.loc`
 - 每段 horizontal/vertical
 - 不穿 forbidden sink
+- 最多 1 个 bend
 
 ## 6. sibling balancing
 
@@ -304,6 +327,7 @@ struct BranchCandidate {
 for each side child:
     build feasible = child_ms ∩ TRR(parent_loc, assigned_edge)
     locs = generate_candidate_locs(child_ms, feasible, parent_loc, sinks)
+    // despite the function name, this stage currently only searches legal straight/L-shape routes
     route = route_to_best_candidate_loc_dag(parent_loc, locs, sinks,
                                             allowed_parent_sink,
                                             allowed_child_sink,
@@ -403,6 +427,7 @@ static double manhattan(const SegmentPoint& a, const SegmentPoint& b);
 static double polyline_length(const std::vector<SegmentPoint>& path);
 static int bend_count(const std::vector<SegmentPoint>& path);
 static std::vector<SegmentPoint> simplify_polyline(std::vector<SegmentPoint> path);
+// Only remove duplicate adjacent points and collinear middle points; never reroute or change geometry.
 static bool segment_crosses_forbidden_sink(...);
 static bool polyline_crosses_forbidden_sink(...);
 ```
