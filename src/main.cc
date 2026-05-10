@@ -30,13 +30,12 @@ int main(int argc, char** argv) {
     common::PartitionTree partition = partitioner::build(problem);
     partitioner::write_output_file(partition, problem, argv[1]);
     std::cout << "Partitioner: wrote part/" + std::string(argv[1]).substr(std::string(argv[1]).find_last_of("/\\") + 1) << "\n";
-    return 0;
 
-    // treer::TopologyTree tree = treer::build(problem, argv[1]);
-    // if (!tree.valid) {
-    //     std::cerr << "Treer error: " << tree.error_msg << "\n";
-    //     return 1;
-    // }
+    treer::TopoTree tree = treer::build(problem, partition, argv[1]);
+    if (!tree.valid) {
+        std::cerr << "Treer error: " << tree.error_msg << "\n";
+        return 1;
+    }
 
     // Temporarily stop after topology generation. Re-enable the following
     // stages when BU/TD/Writer are ready to be run in the full CTS flow.
