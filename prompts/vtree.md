@@ -1,13 +1,13 @@
-下面这版提示词把右侧逻辑改成：红色 internal tap 点就是两个 child 的几何中点，不再使用 NODE.cx/cy 作为右侧红点位置，也不再引入额外的 B 分叉点。
+下面这版提示词把右侧逻辑改成：internal tap 点就是两个 child 的几何中点，并按 `node_kind` 使用不同颜色/marker；不再使用 NODE.cx/cy 作为右侧 tap 点位置，也不再引入额外的 B 分叉点。
 
-请实现/修改 `vtree.py`，它是一个 Python 可视化脚本。不要修改 C++ 代码，不要实现 CTS/DME/router/evaluator。目标是读取 `tree/sample<k>.txt` 中 treer 输出的树结构，以及 `samples/sample<k>.txt` 中的 die/source 信息，画出左右两个子图：
+请实现/修改 `vtree.py`，它是一个 Python 可视化脚本。不要修改 C++ 代码，不要实现 CTS/DME/router/evaluator。目标是读取 `tree/sample<k>_vtree.txt` 中 treer 输出的树结构，以及 `samples/sample<k>.txt` 中的 die/source 信息，画出左右两个子图：
 1. 左侧：二叉树拓扑结构图。
 2. 右侧：在 die grid 上显示 tree 的几何连接。
 同时计算 source 到每个 sink 沿树路径的曼哈顿距离，并输出：
 ```text
 max_est_skew = max(delay) - min(delay)
 
-注意：max_est_skew 不要使用 NODE 行中的 est_delay 字段。
+注意：max_est_skew 不要使用 NODE 行中的 `subtree_skew_to_node` 字段。
 
 ⸻
 
@@ -15,7 +15,7 @@ max_est_skew = max(delay) - min(delay)
 
 树文件：
 
-tree/sample<k>.txt
+tree/sample<k>_vtree.txt
 
 格式示例：
 
@@ -23,7 +23,7 @@ TREE_VALID 1
 ROOT 28
 NUM_NODES 29
 NUM_SINKS 15
-NODE <id> <parent> <left> <right> <is_leaf> <sink_index> <sink_count> <cx> <cy> <bbox_lx> <bbox_ly> <bbox_ux> <bbox_uy> <region_lx> <region_ly> <region_ux> <region_uy> <est_delay>
+NODE <id> <parent> <left> <right> <is_leaf> <sink_index> <sink_count> <cx> <cy> <bbox_lx> <bbox_ly> <bbox_ux> <bbox_uy> <region_lx> <region_ly> <region_ux> <region_uy> <subtree_skew_to_node> <node_kind>
 LEAF <node_id> <sink_index> <sink_id> <x> <y>
 EDGE <parent_id> <child_id>
 
@@ -35,15 +35,11 @@ EDGE <parent_id> <child_id>
 * LEAF
 * EDGE
 
-其中新版 NODE 行有 18 个值，不含开头 NODE token：
+NODE 行有 19 个值，不含开头 NODE token：
 
-id parent left right is_leaf sink_index sink_count cx cy bbox_lx bbox_ly bbox_ux bbox_uy region_lx region_ly region_ux region_uy est_delay
+id parent left right is_leaf sink_index sink_count cx cy bbox_lx bbox_ly bbox_ux bbox_uy region_lx region_ly region_ux region_uy subtree_skew_to_node node_kind
 
-为了兼容旧文件，也要支持旧版 14 个值：
-
-id parent left right is_leaf sink_index sink_count cx cy bbox_lx bbox_ly bbox_ux bbox_uy est_delay
-
-旧版没有 region_*，解析时把 region_lx/ly/ux/uy 设为 0。
+`node_kind` 是以下字符串之一：`SINK`、`CLUSTER_INTERNAL`、`CLUSTER_ACCESS`、`GLOBAL`。不需要兼容旧版 tree 文件格式。
 
 sample 文件：
 
@@ -77,7 +73,8 @@ class Node:
     region_ly: int
     region_ux: int
     region_uy: int
-    est_delay: float
+    subtree_skew_to_node: float
+    node_kind: str
 
 维护：
 
@@ -123,7 +120,7 @@ def manhattan(x1, y1, x2, y2):
 
 compute_max_est_skew(root, nodes, leaf_info, source_pos) 规则：
 
-* 不使用 NODE.est_delay。
+* 不使用 NODE.subtree_skew_to_node。
 * 对每个 leaf：
     * 从 leaf 沿 parent 指针向上走到 root。
     * 每一段距离用 get_node_debug_pos(current) 到 get_node_debug_pos(parent) 的曼哈顿距离。
@@ -155,6 +152,7 @@ compute_max_est_skew(root, nodes, leaf_info, source_pos) 规则：
 * 每个 node 用圆片表示。
 * internal node 圆片中显示 node id。
 * leaf node 圆片中显示 sink_id，例如 L0、R3。
+* 不同 `node_kind` 使用不同颜色，并添加 legend：`SINK` 黑色、`CLUSTER_INTERNAL` 黄色、`CLUSTER_ACCESS` 蓝色、`GLOBAL` 绿色。
 * root node 用金色填充、深橙色边框，并在下方标注 ROOT。
 * node 不要用 matplotlib.patches.Circle，因为 ax.set_aspect("auto") 时会被拉成长椭圆。请使用 ax.scatter() 画 screen-space 圆形 marker，再用 ax.text() 写 label。
 * 当 sink 数量多时，自适应缩小 marker 和 font。
@@ -175,10 +173,9 @@ font_size = max(4, min(8, int(150 / max(num_leaves, 1))))
 右侧目标效果：
 
 * 黑色粗线构成连续树状结构。
-* 黑色实心点表示 sink。
-* 红色空心圆表示 internal tap / branch point。
+* 按 `node_kind` 用不同颜色/marker 显示 node：`SINK` 黑色圆点、`CLUSTER_INTERNAL` 黄色圆点、`CLUSTER_ACCESS` 蓝色方块、`GLOBAL` 绿色菱形。
 * source 用红色三角形表示。
-* 红色 internal tap 点必须位于它的两个 child 的几何中点。
+* internal tap 点必须位于它的两个 child 的几何中点，并按 `node_kind` 上色。
 * 如果 child 是 sink，则 child 坐标就是 LEAF 坐标。
 * 如果 child 是 internal node，则 child 坐标是它自己递归算出来的 visual tap 坐标。
 
@@ -231,7 +228,7 @@ def compute_grid_visual_pos(root, nodes, leaf_info):
 * 这个 visual_pos 只用于右侧 grid 可视化。
 * 它不会修改 nodes[u].cx/cy。
 * 它不影响 max_est_skew 计算。
-* 右侧红色空心圆必须画在 internal node 的 visual_pos[u] 上。
+* 右侧 internal node 标记必须画在 internal node 的 visual_pos[u] 上，并按 `node_kind` 使用对应样式。
 
 ⸻
 
@@ -273,13 +270,26 @@ def draw_grid_tree(ax, root, nodes, leaf_info, edges, width, height, source_pos)
 * 画线时直接 P -> L 和 P -> R。
 * 不要再计算 B。
 * 不要再画 P -> B -> L/R。
-* 因为 P 就是中点，所以两个 child 会自然通过红点合并。
-* 对于底层两个 sink 的合并，红点应该正好在两个 sink 坐标的几何中点。
-* 对于更高层的合并，红点应该在两个 child tap/sink 的中点。
+* 因为 P 就是中点，所以两个 child 会自然通过该 node marker 合并。
+* 对于底层两个 sink 的合并，node marker 应该正好在两个 sink 坐标的几何中点。
+* 对于更高层的合并，node marker 应该在两个 child tap/sink 的中点。
 
 ⸻
 
 右侧节点样式
+
+定义统一样式表：
+
+```python
+KIND_STYLES = {
+    "SINK": {"face": "#202020", "edge": "#202020", "marker": "o"},
+    "CLUSTER_INTERNAL": {"face": "#ffe08a", "edge": "#b7791f", "marker": "o"},
+    "CLUSTER_ACCESS": {"face": "#90cdf4", "edge": "#2b6cb0", "marker": "s"},
+    "GLOBAL": {"face": "#c6f6d5", "edge": "#2f855a", "marker": "D"},
+}
+```
+
+左右两个子图都要显示 node kind legend。
 
 source：
 
@@ -298,7 +308,7 @@ for node_id, (_, sink_id, x, y) in leaf_info.items():
     sink_xs.append(x)
     sink_ys.append(y)
 ax.scatter(sink_xs, sink_ys, marker="o", s=45,
-           color="black", zorder=5)
+           facecolors="#202020", edgecolors="#202020", zorder=5)
 
 sink label 可选，但建议保留：
 
@@ -308,21 +318,23 @@ for node_id, (_, sink_id, x, y) in leaf_info.items():
 
 internal tap：
 
-internal_xs = []
-internal_ys = []
-for node_id, node in nodes.items():
-    if node.is_leaf:
-        continue
-    x, y = visual_pos[node_id]
-    internal_xs.append(x)
-    internal_ys.append(y)
-ax.scatter(internal_xs, internal_ys, marker="o", s=55,
-           facecolors="white", edgecolors="red",
-           linewidths=2.0, zorder=6)
+for kind in ("CLUSTER_INTERNAL", "CLUSTER_ACCESS", "GLOBAL"):
+    xs = []
+    ys = []
+    for node_id, node in nodes.items():
+        if node.node_kind != kind:
+            continue
+        x, y = visual_pos[node_id]
+        xs.append(x)
+        ys.append(y)
+    style = KIND_STYLES[kind]
+    ax.scatter(xs, ys, marker=style["marker"], s=55,
+               facecolors=style["face"], edgecolors=style["edge"],
+               linewidths=2.0, zorder=6)
 
 注意：
 
-* internal tap 包括 root 对应的 visual tap，也可以画红色空心圆。
+* internal tap 包括 root 对应的 visual tap，并按其 `node_kind` 上色。
 * source 仍然单独画红色三角形。
 * 如果 root visual tap 和 source 很近，也照常画。
 
@@ -335,7 +347,7 @@ ax.scatter(internal_xs, internal_ys, marker="o", s=55,
 1. 设置坐标轴范围和 grid。
 2. 调用 draw_branch(root) 画所有黑色粗线。
 3. 画 source 到 root visual tap 的黑色粗线。
-4. 画所有 internal tap 红色空心圆。
+4. 按 `node_kind` 画所有 internal tap marker。
 5. 画所有 sink 黑色实心点和 sink_id label。
 6. 画 source 红色三角形和 SRC label。
 
@@ -353,17 +365,21 @@ ax.set_title("Tree on Die Grid")
 
 命令行：
 
-python3 vtree.py <sample_index>
+python3 vtree.py <sample_index | tree/sample<k>_vtree.txt>
 
 例如：
 
 python3 vtree.py 1
 
+也支持：
+
+python3 vtree.py tree/sample1_vtree.txt
+
 行为：
 
 1. 构造路径：
 
-tree_path = f"tree/sample{idx}.txt"
+tree_path = f"tree/sample{idx}_vtree.txt"
 sample_path = f"samples/sample{idx}.txt"
 
 2. 解析 tree 和 sample。
@@ -413,15 +429,14 @@ python3 vtree.py 1
 应得到：
 
 * 左侧：普通二叉树 topology；parent-child 是直线；internal node 显示 node id；leaf 显示 sink_id；root 金色高亮并标注 ROOT。
-* 右侧：die grid 上的几何树；source 是红色三角形；sink 是黑色实心点；internal tap 是红色空心圆。
-* 右侧每个红色 internal tap 点必须在它的两个 child 的几何中点。
-* 右侧底层两个 sink 合并时，红点应正好在两个 sink 的连线中点。
-* 右侧更高层合并时，红点应在两个 child tap/sink 的连线中点。
-* 右侧黑色粗线直接从红点连到两个 child。
+* 右侧：die grid 上的几何树；source 是红色三角形；其他 node 按 `node_kind` 显示颜色/marker。
+* 右侧每个 internal tap marker 必须在它的两个 child 的几何中点。
+* 右侧底层两个 sink 合并时，tap marker 应正好在两个 sink 的连线中点。
+* 右侧更高层合并时，tap marker 应在两个 child tap/sink 的连线中点。
+* 右侧黑色粗线直接从 tap marker 连到两个 child。
 * 右侧不能是 parent-child 两点直连。
 * 右侧不能是每条 edge 各自独立的 L 形折线。
 * 右侧不能使用额外的 B 点或 P -> B -> L/R 画法。
 * 右侧不能出现红色 tap 点和黑线分叉/连接点明显分离的情况。
 * 终端输出 max_est_skew = ...。
 * figure 标题显示 max_est_skew=...。
-

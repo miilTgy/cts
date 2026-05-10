@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -25,11 +26,61 @@ class Node:
     region_ly: int
     region_ux: int
     region_uy: int
-    est_delay: float
+    subtree_skew_to_node: float
+    node_kind: str
 
 
 LeafInfo = Tuple[int, str, int, int]
 GeoPos = Optional[Tuple[float, float]]
+
+KIND_STYLES = {
+    "SINK": {
+        "face": "#202020",
+        "edge": "#202020",
+        "text": "white",
+        "grid_marker": "o",
+        "label": "Sink",
+    },
+    "CLUSTER_INTERNAL": {
+        "face": "#ffe08a",
+        "edge": "#b7791f",
+        "text": "#1f2933",
+        "grid_marker": "o",
+        "label": "Cluster internal",
+    },
+    "CLUSTER_ACCESS": {
+        "face": "#90cdf4",
+        "edge": "#2b6cb0",
+        "text": "#102a43",
+        "grid_marker": "s",
+        "label": "Cluster access",
+    },
+    "GLOBAL": {
+        "face": "#c6f6d5",
+        "edge": "#2f855a",
+        "text": "#102a43",
+        "grid_marker": "D",
+        "label": "Global",
+    },
+    "UNKNOWN": {
+        "face": "white",
+        "edge": "black",
+        "text": "black",
+        "grid_marker": "o",
+        "label": "Unknown",
+    },
+}
+
+
+def normalize_node_kind(raw: str, is_leaf: bool) -> str:
+    kind = raw.upper()
+    if kind in KIND_STYLES and kind != "UNKNOWN":
+        return kind
+    return "SINK" if is_leaf else "UNKNOWN"
+
+
+def kind_style(node: Node) -> Dict[str, str]:
+    return KIND_STYLES.get(node.node_kind, KIND_STYLES["UNKNOWN"])
 
 
 def fail(message: str) -> None:
@@ -90,30 +141,25 @@ def parse_tree_file(path: str):
                     fail(f"{path}:{line_no}: NUM_SINKS expects 1 value")
                 num_sinks = parse_int(parts[1], "NUM_SINKS")
             elif kind == "NODE":
-                if len(parts) not in (15, 19):
+                if len(parts) != 20:
                     fail(
-                        f"{path}:{line_no}: NODE expects 14 or 18 values after NODE, "
+                        f"{path}:{line_no}: NODE expects 19 values after NODE, "
                         f"got {len(parts) - 1}"
                     )
                 node_id = parse_int(parts[1], "NODE id")
-                if len(parts) == 19:
-                    region_lx = parse_int(parts[14], "NODE region_lx")
-                    region_ly = parse_int(parts[15], "NODE region_ly")
-                    region_ux = parse_int(parts[16], "NODE region_ux")
-                    region_uy = parse_int(parts[17], "NODE region_uy")
-                    est_delay = parse_float(parts[18], "NODE est_delay")
-                else:
-                    region_lx = 0
-                    region_ly = 0
-                    region_ux = 0
-                    region_uy = 0
-                    est_delay = parse_float(parts[14], "NODE est_delay")
+                region_lx = parse_int(parts[14], "NODE region_lx")
+                region_ly = parse_int(parts[15], "NODE region_ly")
+                region_ux = parse_int(parts[16], "NODE region_ux")
+                region_uy = parse_int(parts[17], "NODE region_uy")
+                subtree_skew_to_node = parse_float(parts[18], "NODE subtree_skew_to_node")
+                raw_kind = parts[19]
+                is_leaf = parse_int(parts[5], "NODE is_leaf") != 0
                 node = Node(
                     id=node_id,
                     parent=parse_int(parts[2], "NODE parent"),
                     left=parse_int(parts[3], "NODE left"),
                     right=parse_int(parts[4], "NODE right"),
-                    is_leaf=parse_int(parts[5], "NODE is_leaf") != 0,
+                    is_leaf=is_leaf,
                     sink_index=parse_int(parts[6], "NODE sink_index"),
                     sink_count=parse_int(parts[7], "NODE sink_count"),
                     cx=parse_float(parts[8], "NODE cx"),
@@ -126,7 +172,8 @@ def parse_tree_file(path: str):
                     region_ly=region_ly,
                     region_ux=region_ux,
                     region_uy=region_uy,
-                    est_delay=est_delay,
+                    subtree_skew_to_node=subtree_skew_to_node,
+                    node_kind=normalize_node_kind(raw_kind, is_leaf),
                 )
                 nodes[node_id] = node
             elif kind == "LEAF":
@@ -286,11 +333,11 @@ def compute_tree_depth(root: int, nodes: Dict[int, Node]) -> int:
 
         child_depths = []
         for child_id in (node.left, node.right):
-            if child_id < 0:
-                warn(f"tree depth skipped missing child of node {node_id}")
-                child_depths.append(0)
-            else:
+            if child_id >= 0:
                 child_depths.append(dfs(child_id))
+        if not child_depths:
+            warn(f"tree depth skipped missing children of node {node_id}")
+            return 0
 
         return 1 + max(child_depths)
 
@@ -351,8 +398,9 @@ def draw_topology(
     for node_id, (x, y) in pos.items():
         node = nodes[node_id]
         is_root = node_id == root
-        facecolor = "gold" if is_root else "white"
-        edgecolor = "darkorange" if is_root else "black"
+        style = kind_style(node)
+        facecolor = "gold" if is_root else style["face"]
+        edgecolor = "darkorange" if is_root else style["edge"]
         ax.scatter(
             [x],
             [y],
@@ -367,6 +415,10 @@ def draw_topology(
         else:
             label = str(node_id)
         ax.text(x, y, label, ha="center", va="center", fontsize=font_size, zorder=4)
+        if not node.is_leaf:
+            ax.text(x, y + 0.23, node.node_kind.replace("_", "\n"),
+                    ha="center", va="bottom", fontsize=max(3, font_size * 0.55),
+                    color=style["edge"], zorder=5)
         if is_root:
             ax.text(x, y - 0.4, "ROOT", ha="center", va="top",
                     fontsize=font_size * 0.85, fontweight="bold",
@@ -379,8 +431,28 @@ def draw_topology(
         ax.set_ylim(min(ys) - 1.0, max(ys) + 1.0)
 
     ax.set_title("Binary Topology")
+    add_kind_legend(ax)
     ax.set_aspect("auto")
     ax.axis("off")
+
+
+def add_kind_legend(ax) -> None:
+    handles = []
+    labels = []
+    for kind in ("SINK", "CLUSTER_INTERNAL", "CLUSTER_ACCESS", "GLOBAL"):
+        style = KIND_STYLES[kind]
+        handle = ax.scatter(
+            [],
+            [],
+            s=55,
+            marker=style["grid_marker"],
+            facecolors=style["face"],
+            edgecolors=style["edge"],
+            linewidths=1.2,
+        )
+        handles.append(handle)
+        labels.append(style["label"])
+    ax.legend(handles, labels, loc="upper right", fontsize=7, frameon=True)
 
 
 def compute_grid_visual_pos(
@@ -411,22 +483,20 @@ def compute_grid_visual_pos(
                 return None
             visual_pos[node_id] = get_leaf_pos(node_id, leaf_info)
         else:
-            left_id = node.left
-            right_id = node.right
-            if left_id < 0 or right_id < 0:
+            child_ids = [child_id for child_id in (node.left, node.right) if child_id >= 0]
+            if not child_ids:
                 warn(f"grid visual position skipped incomplete children of node {node_id}")
                 visiting.remove(node_id)
                 return None
 
-            left_pos = dfs(left_id)
-            right_pos = dfs(right_id)
-            if left_pos is None or right_pos is None:
+            child_positions = [dfs(child_id) for child_id in child_ids]
+            if any(pos is None for pos in child_positions):
                 warn(f"grid visual position skipped node {node_id} because child position is missing")
                 visiting.remove(node_id)
                 return None
 
-            ux = (left_pos[0] + right_pos[0]) / 2.0
-            uy = (left_pos[1] + right_pos[1]) / 2.0
+            ux = sum(pos[0] for pos in child_positions if pos is not None) / len(child_positions)
+            uy = sum(pos[1] for pos in child_positions if pos is not None) / len(child_positions)
             visual_pos[node_id] = (ux, uy)
 
         visiting.remove(node_id)
@@ -470,25 +540,17 @@ def draw_grid_tree(
         if node.is_leaf:
             return
 
-        left_id = node.left
-        right_id = node.right
-        if node_id not in visual_pos or left_id not in visual_pos or right_id not in visual_pos:
+        child_ids = [child_id for child_id in (node.left, node.right) if child_id >= 0]
+        if node_id not in visual_pos or any(child_id not in visual_pos for child_id in child_ids):
             warn(f"geometry branch skipped node {node_id} because visual position is missing")
             return
 
         parent_pos = visual_pos[node_id]
-        left_pos = visual_pos[left_id]
-        right_pos = visual_pos[right_id]
-
         px, py = parent_pos
-        lx, ly = left_pos
-        rx, ry = right_pos
-
-        ax.plot([px, lx], [py, ly], color="black", linewidth=2.8, zorder=1)
-        ax.plot([px, rx], [py, ry], color="black", linewidth=2.8, zorder=1)
-
-        draw_branch(left_id)
-        draw_branch(right_id)
+        for child_id in child_ids:
+            cx, cy = visual_pos[child_id]
+            ax.plot([px, cx], [py, cy], color="black", linewidth=2.8, zorder=1)
+            draw_branch(child_id)
 
     draw_branch(root)
     root_pos = visual_pos.get(root)
@@ -503,8 +565,7 @@ def draw_grid_tree(
     else:
         warn(f"source-to-root connection skipped because root visual position is missing")
 
-    internal_xs = []
-    internal_ys = []
+    internal_by_kind: Dict[str, Tuple[List[float], List[float]]] = {}
     for node_id, node in nodes.items():
         if node.is_leaf:
             continue
@@ -512,40 +573,37 @@ def draw_grid_tree(
             warn(f"geometry tap for node {node_id} skipped because visual position is missing")
             continue
         x, y = visual_pos[node_id]
-        internal_xs.append(x)
-        internal_ys.append(y)
+        xs, ys = internal_by_kind.setdefault(node.node_kind, ([], []))
+        xs.append(x)
+        ys.append(y)
 
-    if internal_xs:
+    for kind, (xs, ys) in internal_by_kind.items():
+        style = KIND_STYLES.get(kind, KIND_STYLES["UNKNOWN"])
         ax.scatter(
-            internal_xs,
-            internal_ys,
-            marker="o",
+            xs,
+            ys,
+            marker=style["grid_marker"],
             s=55,
-            facecolors="white",
-            edgecolors="red",
+            facecolors=style["face"],
+            edgecolors=style["edge"],
             linewidths=2.0,
             zorder=6,
         )
 
-    sink_xs = []
-    sink_ys = []
-    sink_ids = []
     for node_id, (sink_index, sink_id, lx, ly) in leaf_info.items():
-        sink_xs.append(float(lx))
-        sink_ys.append(float(ly))
-        sink_ids.append(sink_id)
-
-    if sink_xs:
+        node = nodes.get(node_id)
+        style = kind_style(node) if node is not None else KIND_STYLES["SINK"]
         ax.scatter(
-            sink_xs, sink_ys,
-            marker="o",
+            [float(lx)], [float(ly)],
+            marker=style["grid_marker"],
             s=45,
-            color="black",
+            facecolors=style["face"],
+            edgecolors=style["edge"],
+            linewidths=1.2,
             zorder=5,
         )
-        for x, y, label in zip(sink_xs, sink_ys, sink_ids):
-            ax.text(x, y, label, ha="center", va="center", fontsize=sink_font_size,
-                    color="black", zorder=7)
+        ax.text(float(lx), float(ly), sink_id, ha="center", va="center",
+                fontsize=sink_font_size, color=style["text"], zorder=7)
 
     sx, sy = source_pos
     ax.scatter(
@@ -559,21 +617,39 @@ def draw_grid_tree(
     )
     ax.text(sx, sy, "SRC", ha="center", va="bottom", fontsize=10,
             color="darkred", zorder=11)
+    add_kind_legend(ax)
 
 
 def print_usage() -> None:
-    print("Usage: python3 vtree.py <sample_index>")
+    print("Usage: python3 vtree.py <sample_index | tree/sample<k>_vtree.txt>")
     print("Example: python3 vtree.py 1")
+    print("Example: python3 vtree.py tree/sample1_vtree.txt")
+
+
+def resolve_paths(arg: str) -> Tuple[str, str, str]:
+    if arg.isdigit():
+        idx = arg
+        return f"tree/sample{idx}_vtree.txt", f"samples/sample{idx}.txt", f"sample{idx}"
+
+    tree_path = arg
+    base = os.path.basename(tree_path)
+    match = re.match(r"(sample(\d+))(?:_vtree)?\.txt$", base)
+    if not match:
+        fail(
+            "tree path must look like tree/sample<k>_vtree.txt "
+            "or pass just the sample index"
+        )
+    sample_base = match.group(1)
+    idx = match.group(2)
+    return tree_path, f"samples/sample{idx}.txt", sample_base
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+    if len(sys.argv) != 2:
         print_usage()
         sys.exit(1)
 
-    idx = sys.argv[1]
-    tree_path = f"tree/sample{idx}.txt"
-    sample_path = f"samples/sample{idx}.txt"
+    tree_path, sample_path, sample_base = resolve_paths(sys.argv[1])
 
     if not os.path.exists(tree_path):
         fail(f"tree file not found: {tree_path}")
@@ -613,13 +689,14 @@ def main() -> None:
     )
     draw_topology(ax1, root, nodes, leaf_info, edges)
     draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height, source_pos)
-    fig.suptitle(f"Topology Tree Visualization: sample{idx} | max_est_skew={max_est_skew:.3f}")
+    fig.suptitle(f"Topology Tree Visualization: {sample_base} | max_est_skew={max_est_skew:.3f}")
 
     backend = plt.get_backend().lower()
+    output_path = f"tree/{sample_base}_vtree.png"
+    fig.savefig(output_path, dpi=160)
+    print(f"saved visualization: {output_path}")
     if "agg" in backend or "pdf" in backend or "svg" in backend:
-        output_path = f"tree/sample{idx}_vtree.png"
-        fig.savefig(output_path, dpi=160)
-        print(f"saved visualization: {output_path}")
+        return
     else:
         plt.show()
 
