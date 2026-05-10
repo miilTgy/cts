@@ -6,14 +6,16 @@
 
 namespace treer {
 
-using TopologyTree = common::TopologyTree;
-using TreeNode = common::TreeNode;
+using TopoTree = common::TopoTree;
+using TopoNode = common::TopoNode;
 
 void debug_enable(bool enable);
-void debug_output(const TopologyTree& tree, const common::Problem& problem);
-void debug_output_file(const TopologyTree& tree,
+void debug_output(const TopoTree& tree, const common::Problem& problem);
+void debug_output_file(const TopoTree& tree,
                        const common::Problem& problem,
                        const std::string& input_path);
-TopologyTree build(const common::Problem& problem, const std::string& input_path = "");
+TopoTree build(const common::Problem& problem,
+               const common::PartitionTree& partition_tree,
+               const std::string& sample_name_or_input_path = "");
 
 }  // namespace treer

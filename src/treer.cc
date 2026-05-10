@@ -1,11 +1,12 @@
 #include "treer.h"
 
+#include "partreer.h"
+
 #include <algorithm>
-#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <limits>
+#include <set>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -15,389 +16,128 @@ namespace {
 
 static bool g_debug_enabled = false;
 
-static double manhattan(double x1, double y1, double x2, double y2) {
-    return std::abs(x1 - x2) + std::abs(y1 - y2);
+static const char* kind_to_string(common::NodeKind kind) {
+    switch (kind) {
+        case common::NodeKind::Sink:
+            return "SINK";
+        case common::NodeKind::ClusterInternal:
+            return "CLUSTER_INTERNAL";
+        case common::NodeKind::ClusterAccess:
+            return "CLUSTER_ACCESS";
+        case common::NodeKind::Global:
+            return "GLOBAL";
+    }
+    return "UNKNOWN";
 }
 
-struct BBox {
-    int lx = 0;
-    int ly = 0;
-    int ux = 0;
-    int uy = 0;
-};
+static int manhattan(const common::Point& a, const common::Point& b) {
+    return std::abs(a.x - b.x) + std::abs(a.y - b.y);
+}
 
-struct Center {
-    double x = 0.0;
-    double y = 0.0;
-};
-
-static double clamp_double(double value, double lo, double hi) {
+static int clamp_int(int value, int lo, int hi) {
     return std::max(lo, std::min(value, hi));
 }
 
-static BBox union_node_bbox(const common::TreeNode& a, const common::TreeNode& b) {
-    BBox result;
-    result.lx = std::min(a.bbox_lx, b.bbox_lx);
-    result.ly = std::min(a.bbox_ly, b.bbox_ly);
-    result.ux = std::max(a.bbox_ux, b.bbox_ux);
-    result.uy = std::max(a.bbox_uy, b.bbox_uy);
-    return result;
+static common::BBox union_bbox(const common::BBox& a, const common::BBox& b) {
+    return {std::min(a.lx, b.lx),
+            std::min(a.ly, b.ly),
+            std::max(a.ux, b.ux),
+            std::max(a.uy, b.uy)};
 }
 
-static double bbox_hpwl(const BBox& bbox) {
-    return static_cast<double>(bbox.ux - bbox.lx) +
-           static_cast<double>(bbox.uy - bbox.ly);
+static void update_delay_fields(common::TopoNode& parent,
+                                const common::TopoNode& left,
+                                const common::TopoNode& right) {
+    const int left_edge = manhattan(parent.loc, left.loc);
+    const int right_edge = manhattan(parent.loc, right.loc);
+
+    parent.left_min_delay_to_node = left.subtree_min_delay_to_node + left_edge;
+    parent.left_max_delay_to_node = left.subtree_max_delay_to_node + left_edge;
+    parent.left_skew_to_node = parent.left_max_delay_to_node -
+                               parent.left_min_delay_to_node;
+
+    parent.right_min_delay_to_node = right.subtree_min_delay_to_node + right_edge;
+    parent.right_max_delay_to_node = right.subtree_max_delay_to_node + right_edge;
+    parent.right_skew_to_node = parent.right_max_delay_to_node -
+                                parent.right_min_delay_to_node;
+
+    parent.subtree_min_delay_to_node =
+        std::min(parent.left_min_delay_to_node, parent.right_min_delay_to_node);
+    parent.subtree_max_delay_to_node =
+        std::max(parent.left_max_delay_to_node, parent.right_max_delay_to_node);
+    parent.subtree_skew_to_node = parent.subtree_max_delay_to_node -
+                                  parent.subtree_min_delay_to_node;
 }
 
-static common::TreeNode make_leaf(int id,
-                                  int sink_index,
-                                  const common::Sink& sink,
-                                  const common::Problem& problem) {
-    common::TreeNode node;
-    node.id = id;
-    node.is_leaf = true;
-    node.sink_index = sink_index;
-    node.sink_count = 1;
-    node.cx = static_cast<double>(sink.loc.x);
-    node.cy = static_cast<double>(sink.loc.y);
-    node.bbox_lx = sink.loc.x;
-    node.bbox_ly = sink.loc.y;
-    node.bbox_ux = sink.loc.x;
-    node.bbox_uy = sink.loc.y;
-    node.region_lx = 0;
-    node.region_ly = 0;
-    node.region_ux = problem.die_width;
-    node.region_uy = problem.die_height;
-    node.est_delay = 0.0;
-    return node;
+static common::Point merge_point(const common::TopoNode& left,
+                                 const common::TopoNode& right,
+                                 common::Point external_target,
+                                 const common::Problem& problem) {
+    common::Point p;
+    p.x = (left.loc.x + right.loc.x + 1) / 2;
+    p.y = (left.loc.y + right.loc.y + 1) / 2;
+    if (external_target.x > p.x) ++p.x;
+    if (external_target.x < p.x) --p.x;
+    if (external_target.y > p.y) ++p.y;
+    if (external_target.y < p.y) --p.y;
+    p.x = clamp_int(p.x, 0, problem.die_width);
+    p.y = clamp_int(p.y, 0, problem.die_height);
+    return p;
 }
 
-static Center compute_tap_point(const common::TreeNode& left,
-                                const common::TreeNode& right,
-                                double& parent_est_delay) {
-    const double ax = left.cx;
-    const double ay = left.cy;
-    const double bx = right.cx;
-    const double by = right.cy;
-    const double D = manhattan(ax, ay, bx, by);
-    const double dl = left.est_delay;
-    const double dr = right.est_delay;
+static int create_parent(common::TopoTree& tree,
+                         int left_id,
+                         int right_id,
+                         common::Point external_target,
+                         const common::Problem& problem) {
+    const common::TopoNode left = tree.nodes[static_cast<std::size_t>(left_id)];
+    const common::TopoNode right = tree.nodes[static_cast<std::size_t>(right_id)];
 
-    Center tap;
-    if (D == 0.0) {
-        tap.x = ax;
-        tap.y = ay;
-        parent_est_delay = std::max(dl, dr);
-        return tap;
-    }
-
-    double t = (D + dr - dl) / 2.0;
-    t = clamp_double(t, 0.0, D);
-
-    const double sx = (bx > ax) ? 1.0 : ((bx < ax) ? -1.0 : 0.0);
-    const double sy = (by > ay) ? 1.0 : ((by < ay) ? -1.0 : 0.0);
-    const double dx = std::abs(bx - ax);
-
-    double remaining = t;
-    if (remaining <= dx) {
-        tap.x = ax + sx * remaining;
-        tap.y = ay;
-    } else {
-        tap.x = bx;
-        tap.y = ay + sy * (remaining - dx);
-    }
-
-    parent_est_delay = std::max(dl + t, dr + (D - t));
-    return tap;
-}
-
-static common::TreeNode make_internal(int id,
-                                      const common::TreeNode& left,
-                                      const common::TreeNode& right,
-                                      const common::Problem& problem) {
-    common::TreeNode parent;
-    parent.id = id;
-    parent.is_leaf = false;
-    parent.sink_index = -1;
-    parent.left = left.id;
-    parent.right = right.id;
-    parent.sink_count = left.sink_count + right.sink_count;
-
-    double parent_est_delay = 0.0;
-    const Center tap = compute_tap_point(left, right, parent_est_delay);
-    parent.cx = tap.x;
-    parent.cy = tap.y;
-    parent.est_delay = parent_est_delay;
-
-    const BBox bbox = union_node_bbox(left, right);
-    parent.bbox_lx = bbox.lx;
-    parent.bbox_ly = bbox.ly;
-    parent.bbox_ux = bbox.ux;
-    parent.bbox_uy = bbox.uy;
-
+    common::TopoNode parent;
+    parent.id = static_cast<int>(tree.nodes.size());
+    parent.left = left_id;
+    parent.right = right_id;
+    parent.kind = common::NodeKind::Global;
+    parent.loc = merge_point(left, right, external_target, problem);
+    parent.bbox = union_bbox(left.bbox, right.bbox);
+    parent.sink_indices = left.sink_indices;
+    parent.sink_indices.insert(parent.sink_indices.end(),
+                               right.sink_indices.begin(),
+                               right.sink_indices.end());
+    std::sort(parent.sink_indices.begin(), parent.sink_indices.end());
     parent.region_lx = 0;
     parent.region_ly = 0;
     parent.region_ux = problem.die_width;
     parent.region_uy = problem.die_height;
+    update_delay_fields(parent, left, right);
 
-    return parent;
-}
-
-static double pair_cost(const common::TreeNode& a,
-                        const common::TreeNode& b,
-                        const common::Problem& problem) {
-    const double l1 = manhattan(a.cx, a.cy, b.cx, b.cy);
-    const BBox ub = union_node_bbox(a, b);
-    const double hpwl = bbox_hpwl(ub);
-    const double delay_diff = std::abs(a.est_delay - b.est_delay);
-    const double mid_x = (a.cx + b.cx) / 2.0;
-    const double mid_y = (a.cy + b.cy) / 2.0;
-    const double src_x = static_cast<double>(problem.source.loc.x);
-    const double src_y = static_cast<double>(problem.source.loc.y);
-    const double source_tie = manhattan(src_x, src_y, mid_x, mid_y);
-    const double sink_diff = std::abs(static_cast<double>(a.sink_count) -
-                                      static_cast<double>(b.sink_count));
-
-    return 1.0 * l1 +
-           0.15 * hpwl +
-           0.05 * delay_diff +
-           0.001 * source_tie +
-           0.0001 * sink_diff;
-}
-
-static int orientation(double px, double py,
-                       double qx, double qy,
-                       double rx, double ry) {
-    const double val = (qy - py) * (rx - qx) - (qx - px) * (ry - qy);
-    if (val == 0.0) return 0;
-    return (val > 0.0) ? 1 : 2;
-}
-
-static bool on_segment(double px, double py,
-                       double qx, double qy,
-                       double rx, double ry) {
-    return qx <= std::max(px, rx) && qx >= std::min(px, rx) &&
-           qy <= std::max(py, ry) && qy >= std::min(py, ry);
-}
-
-static bool segments_properly_intersect(double p1x, double p1y,
-                                        double q1x, double q1y,
-                                        double p2x, double p2y,
-                                        double q2x, double q2y) {
-    const int o1 = orientation(p1x, p1y, q1x, q1y, p2x, p2y);
-    const int o2 = orientation(p1x, p1y, q1x, q1y, q2x, q2y);
-    const int o3 = orientation(p2x, p2y, q2x, q2y, p1x, p1y);
-    const int o4 = orientation(p2x, p2y, q2x, q2y, q1x, q1y);
-
-    if (o1 != o2 && o3 != o4) return true;
-
-    if (o1 == 0 && on_segment(p1x, p1y, p2x, p2y, q1x, q1y)) return false;
-    if (o2 == 0 && on_segment(p1x, p1y, q2x, q2y, q1x, q1y)) return false;
-    if (o3 == 0 && on_segment(p2x, p2y, p1x, p1y, q2x, q2y)) return false;
-    if (o4 == 0 && on_segment(p2x, p2y, q1x, q1y, q2x, q2y)) return false;
-
-    return false;
-}
-
-static double point_to_segment_dist_sq(double px, double py,
-                                       double ax, double ay,
-                                       double bx, double by) {
-    const double abx = bx - ax;
-    const double aby = by - ay;
-    const double apx = px - ax;
-    const double apy = py - ay;
-    const double len_sq = abx * abx + aby * aby;
-
-    if (len_sq == 0.0) {
-        return apx * apx + apy * apy;
+    const int id = parent.id;
+    tree.nodes.push_back(parent);
+    tree.nodes[static_cast<std::size_t>(left_id)].parent = id;
+    tree.nodes[static_cast<std::size_t>(right_id)].parent = id;
+    if (g_debug_enabled) {
+        std::cout << "[TREER] merge left=" << left_id
+                  << " right=" << right_id
+                  << " root=" << id
+                  << " kind=" << kind_to_string(parent.kind)
+                  << " loc=(" << parent.loc.x << "," << parent.loc.y << ")"
+                  << " skew=" << parent.subtree_skew_to_node << "\n";
     }
-
-    double t = (apx * abx + apy * aby) / len_sq;
-    t = clamp_double(t, 0.0, 1.0);
-
-    const double proj_x = ax + t * abx;
-    const double proj_y = ay + t * aby;
-    const double dx = px - proj_x;
-    const double dy = py - proj_y;
-    return dx * dx + dy * dy;
+    return id;
 }
 
-static bool segment_passes_near_center(double cx, double cy,
-                                       double ax, double ay,
-                                       double bx, double by) {
-    constexpr double kEps = 1e-9;
-    const double dist_sq = point_to_segment_dist_sq(cx, cy, ax, ay, bx, by);
-    if (dist_sq > kEps * kEps) return false;
-
-    const double apx = cx - ax;
-    const double apy = cy - ay;
-    const double abx = bx - ax;
-    const double aby = by - ay;
-    const double len_sq = abx * abx + aby * aby;
-    if (len_sq == 0.0) return false;
-
-    const double dot = apx * abx + apy * aby;
-    if (dot < -kEps || dot > len_sq + kEps) return false;
-
-    return true;
-}
-
-struct RgmCandidate {
-    int i;
-    int j;
-    double cost;
-};
-
-struct RgmSegment {
-    double x1;
-    double y1;
-    double x2;
-    double y2;
-};
-
-static std::vector<int> rgm_round(const std::vector<int>& active,
-                                  const common::Problem& problem,
-                                  common::TopologyTree& tree) {
-    const int n = static_cast<int>(active.size());
-
-    std::vector<RgmCandidate> candidates;
-    candidates.reserve(static_cast<std::size_t>(n) * static_cast<std::size_t>(n - 1) / 2);
-
-    for (int i = 0; i < n; ++i) {
-        const common::TreeNode& node_i = tree.nodes[static_cast<std::size_t>(active[i])];
-        for (int j = i + 1; j < n; ++j) {
-            const common::TreeNode& node_j = tree.nodes[static_cast<std::size_t>(active[j])];
-            const double cost = pair_cost(node_i, node_j, problem);
-            candidates.push_back({i, j, cost});
-        }
-    }
-
-    std::sort(candidates.begin(), candidates.end(),
-              [&](const RgmCandidate& a, const RgmCandidate& b) {
-                  if (a.cost != b.cost) return a.cost < b.cost;
-                  const int a_min = std::min(active[a.i], active[a.j]);
-                  const int a_max = std::max(active[a.i], active[a.j]);
-                  const int b_min = std::min(active[b.i], active[b.j]);
-                  const int b_max = std::max(active[b.i], active[b.j]);
-                  if (a_min != b_min) return a_min < b_min;
-                  return a_max < b_max;
-              });
-
-    std::vector<bool> used(static_cast<std::size_t>(n), false);
-    std::vector<RgmCandidate> selected;
-    std::vector<RgmSegment> selected_segs;
-
-    for (const RgmCandidate& cand : candidates) {
-        if (used[cand.i] || used[cand.j]) continue;
-
-        const common::TreeNode& node_i =
-            tree.nodes[static_cast<std::size_t>(active[cand.i])];
-        const common::TreeNode& node_j =
-            tree.nodes[static_cast<std::size_t>(active[cand.j])];
-        const double ax = node_i.cx;
-        const double ay = node_i.cy;
-        const double bx = node_j.cx;
-        const double by = node_j.cy;
-
-        bool crosses = false;
-        for (const RgmSegment& seg : selected_segs) {
-            if (segments_properly_intersect(
-                    ax, ay, bx, by, seg.x1, seg.y1, seg.x2, seg.y2)) {
-                crosses = true;
-                break;
-            }
-        }
-        if (crosses) continue;
-
-        bool passes = false;
-        for (int k = 0; k < n; ++k) {
-            if (k == cand.i || k == cand.j) continue;
-            const common::TreeNode& node_k =
-                tree.nodes[static_cast<std::size_t>(active[k])];
-            if (segment_passes_near_center(node_k.cx, node_k.cy, ax, ay, bx, by)) {
-                passes = true;
-                break;
-            }
-        }
-        if (passes) continue;
-
-        used[cand.i] = true;
-        used[cand.j] = true;
-        selected.push_back(cand);
-        selected_segs.push_back({ax, ay, bx, by});
-    }
-
-    if (selected.empty()) {
-        const RgmCandidate& fallback = candidates[0];
-        used[fallback.i] = true;
-        used[fallback.j] = true;
-        selected.push_back(fallback);
-    }
-
-    std::vector<int> new_active;
-    for (const RgmCandidate& cand : selected) {
-        int id_i = active[cand.i];
-        int id_j = active[cand.j];
-        const common::TreeNode& node_i =
-            tree.nodes[static_cast<std::size_t>(id_i)];
-        const common::TreeNode& node_j =
-            tree.nodes[static_cast<std::size_t>(id_j)];
-
-        int left_id = id_i;
-        int right_id = id_j;
-        if (node_i.cx < node_j.cx) {
-            left_id = id_i;
-            right_id = id_j;
-        } else if (node_i.cx > node_j.cx) {
-            left_id = id_j;
-            right_id = id_i;
-        } else if (node_i.cy < node_j.cy) {
-            left_id = id_i;
-            right_id = id_j;
-        } else if (node_i.cy > node_j.cy) {
-            left_id = id_j;
-            right_id = id_i;
-        } else if (id_i < id_j) {
-            left_id = id_i;
-            right_id = id_j;
-        } else {
-            left_id = id_j;
-            right_id = id_i;
-        }
-
-        const int parent_id = static_cast<int>(tree.nodes.size());
-        common::TreeNode parent = make_internal(
-            parent_id,
-            tree.nodes[static_cast<std::size_t>(left_id)],
-            tree.nodes[static_cast<std::size_t>(right_id)],
-            problem);
-        tree.nodes.push_back(parent);
-        tree.nodes[static_cast<std::size_t>(left_id)].parent = parent_id;
-        tree.nodes[static_cast<std::size_t>(right_id)].parent = parent_id;
-        new_active.push_back(parent_id);
-    }
-
-    for (int i = 0; i < n; ++i) {
-        if (!used[i]) {
-            new_active.push_back(active[i]);
-        }
-    }
-
-    return new_active;
-}
-
-static std::string get_basename(const std::string& input_path) {
-    if (input_path.empty()) {
-        return "tree_debug.txt";
-    }
+static std::string basename_no_ext(const std::string& input_path) {
+    if (input_path.empty()) return "sample";
     const std::size_t pos = input_path.find_last_of("/\\");
-    if (pos == std::string::npos) {
-        return input_path;
-    }
-    if (pos + 1 >= input_path.size()) {
-        return "tree_debug.txt";
-    }
-    return input_path.substr(pos + 1);
+    std::string base = (pos == std::string::npos) ? input_path : input_path.substr(pos + 1);
+    const std::size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos) base = base.substr(0, dot);
+    if (base.empty()) return "sample";
+    return base;
+}
+
+static std::string output_path_for(const std::string& input_path) {
+    return "tree/" + basename_no_ext(input_path) + "_vtree.txt";
 }
 
 static bool ensure_tree_dir() {
@@ -410,19 +150,67 @@ static bool ensure_tree_dir() {
     return true;
 }
 
-static void write_node_line(std::ostream& out, const common::TreeNode& node) {
-    out << "NODE " << node.id << " " << node.parent << " "
-        << node.left << " " << node.right << " "
-        << (node.is_leaf ? 1 : 0) << " " << node.sink_index << " "
-        << node.sink_count << " " << node.cx << " " << node.cy << " "
-        << node.bbox_lx << " " << node.bbox_ly << " "
-        << node.bbox_ux << " " << node.bbox_uy << " "
-        << node.region_lx << " " << node.region_ly << " "
-        << node.region_ux << " " << node.region_uy << " "
-        << node.est_delay << "\n";
+static int append_local_tree(common::TopoTree& global,
+                             const common::TopoTree& local) {
+    const int offset = static_cast<int>(global.nodes.size());
+    for (const common::TopoNode& old_node : local.nodes) {
+        common::TopoNode node = old_node;
+        node.id += offset;
+        if (node.parent != -1) node.parent += offset;
+        if (node.left != -1) node.left += offset;
+        if (node.right != -1) node.right += offset;
+        global.nodes.push_back(node);
+    }
+    return local.cluster_root + offset;
 }
 
-static bool write_tree_file(const common::TopologyTree& tree,
+static int merge_child_roots(std::vector<int> roots,
+                             common::Point external_target,
+                             common::TopoTree& tree,
+                             const common::Problem& problem) {
+    if (roots.empty()) return -1;
+    if (roots.size() == 1) return roots[0];
+
+    std::stable_sort(roots.begin(), roots.end(), [&](int a, int b) {
+        const common::Point& pa = tree.nodes[static_cast<std::size_t>(a)].loc;
+        const common::Point& pb = tree.nodes[static_cast<std::size_t>(b)].loc;
+        const int da = manhattan(pa, external_target);
+        const int db = manhattan(pb, external_target);
+        if (da != db) return da < db;
+        if (pa.x != pb.x) return pa.x < pb.x;
+        if (pa.y != pb.y) return pa.y < pb.y;
+        return a < b;
+    });
+
+    while (roots.size() > 1) {
+        std::vector<int> next;
+        for (std::size_t i = 0; i < roots.size(); i += 2) {
+            if (i + 1 >= roots.size()) {
+                next.push_back(roots[i]);
+                continue;
+            }
+            next.push_back(create_parent(tree, roots[i], roots[i + 1],
+                                         external_target, problem));
+        }
+        roots = std::move(next);
+    }
+    return roots[0];
+}
+
+static void write_node_line(std::ostream& out, const common::TopoNode& node) {
+    out << "NODE " << node.id << " " << node.parent << " "
+        << node.left << " " << node.right << " "
+        << (node.is_sink ? 1 : 0) << " " << node.sink_index << " "
+        << node.sink_indices.size() << " " << node.loc.x << " " << node.loc.y << " "
+        << node.bbox.lx << " " << node.bbox.ly << " "
+        << node.bbox.ux << " " << node.bbox.uy << " "
+        << node.region_lx << " " << node.region_ly << " "
+        << node.region_ux << " " << node.region_uy << " "
+        << node.subtree_skew_to_node << " "
+        << kind_to_string(node.kind) << "\n";
+}
+
+static bool write_tree_file(const common::TopoTree& tree,
                             const common::Problem& problem,
                             const std::string& output_path) {
     std::ofstream fout(output_path);
@@ -436,33 +224,34 @@ static bool write_tree_file(const common::TopologyTree& tree,
     fout << "NUM_NODES " << tree.nodes.size() << "\n";
     fout << "NUM_SINKS " << problem.sinks.size() << "\n\n";
 
-    for (const common::TreeNode& node : tree.nodes) {
+    for (const common::TopoNode& node : tree.nodes) {
         write_node_line(fout, node);
     }
     fout << "\n";
 
-    for (const common::TreeNode& node : tree.nodes) {
-        if (node.is_leaf &&
+    for (const common::TopoNode& node : tree.nodes) {
+        if (node.is_sink &&
             node.sink_index >= 0 &&
             static_cast<std::size_t>(node.sink_index) < problem.sinks.size()) {
-            const common::Sink& sink = problem.sinks[static_cast<std::size_t>(node.sink_index)];
+            const common::Sink& sink =
+                problem.sinks[static_cast<std::size_t>(node.sink_index)];
             fout << "LEAF " << node.id << " " << node.sink_index << " "
                  << sink.id << " " << sink.loc.x << " " << sink.loc.y << "\n";
         }
     }
     fout << "\n";
 
-    for (const common::TreeNode& node : tree.nodes) {
-        if (!node.is_leaf) {
-            fout << "EDGE " << node.id << " " << node.left << "\n";
-            fout << "EDGE " << node.id << " " << node.right << "\n";
+    for (const common::TopoNode& node : tree.nodes) {
+        if (!node.is_sink) {
+            if (node.left >= 0) fout << "EDGE " << node.id << " " << node.left << "\n";
+            if (node.right >= 0) fout << "EDGE " << node.id << " " << node.right << "\n";
         }
     }
     return true;
 }
 
 static bool collect_subtree_sinks(int node_id,
-                                  const common::TopologyTree& tree,
+                                  const common::TopoTree& tree,
                                   const common::Problem& problem,
                                   std::vector<int>& node_state,
                                   std::vector<int>& sink_seen,
@@ -486,8 +275,8 @@ static bool collect_subtree_sinks(int node_id,
 
     node_state[idx] = 1;
     ++reachable_nodes;
-    const common::TreeNode& node = tree.nodes[idx];
-    if (node.is_leaf) {
+    const common::TopoNode& node = tree.nodes[idx];
+    if (node.is_sink) {
         if (node.sink_index < 0 ||
             static_cast<std::size_t>(node.sink_index) >= problem.sinks.size()) {
             err = "Leaf node has invalid sink index";
@@ -503,32 +292,21 @@ static bool collect_subtree_sinks(int node_id,
     } else {
         std::vector<int> left_sinks;
         std::vector<int> right_sinks;
-        if (!collect_subtree_sinks(node.left,
-                                   tree,
-                                   problem,
-                                   node_state,
-                                   sink_seen,
-                                   reachable_nodes,
-                                   left_sinks,
-                                   err)) {
+        if (!collect_subtree_sinks(node.left, tree, problem, node_state,
+                                   sink_seen, reachable_nodes, left_sinks, err)) {
             return false;
         }
-        if (!collect_subtree_sinks(node.right,
-                                   tree,
-                                   problem,
-                                   node_state,
-                                   sink_seen,
-                                   reachable_nodes,
-                                   right_sinks,
-                                   err)) {
+        if (node.right >= 0 &&
+            !collect_subtree_sinks(node.right, tree, problem, node_state,
+                                   sink_seen, reachable_nodes, right_sinks, err)) {
             return false;
         }
-
         sink_indices.reserve(left_sinks.size() + right_sinks.size());
         sink_indices.insert(sink_indices.end(), left_sinks.begin(), left_sinks.end());
         sink_indices.insert(sink_indices.end(), right_sinks.begin(), right_sinks.end());
-        if (node.sink_count != static_cast<int>(sink_indices.size())) {
-            err = "Subtree sink_count does not match descendant leaves";
+        std::sort(sink_indices.begin(), sink_indices.end());
+        if (node.sink_indices != sink_indices) {
+            err = "Subtree sink_indices do not match descendant leaves";
             return false;
         }
     }
@@ -537,7 +315,7 @@ static bool collect_subtree_sinks(int node_id,
     return true;
 }
 
-static bool validate_tree(const common::TopologyTree& tree,
+static bool validate_tree(const common::TopoTree& tree,
                           const common::Problem& problem,
                           std::string& err) {
     if (tree.root < 0 || static_cast<std::size_t>(tree.root) >= tree.nodes.size()) {
@@ -551,55 +329,65 @@ static bool validate_tree(const common::TopologyTree& tree,
 
     int leaf_count = 0;
     for (std::size_t i = 0; i < tree.nodes.size(); ++i) {
-        const common::TreeNode& node = tree.nodes[i];
+        const common::TopoNode& node = tree.nodes[i];
         if (node.id != static_cast<int>(i)) {
             err = "Tree node id does not match vector index";
             return false;
         }
-        if (node.region_lx > node.region_ux || node.region_ly > node.region_uy) {
-            err = "Tree node has invalid region";
-            return false;
-        }
-        if (node.bbox_lx > node.bbox_ux || node.bbox_ly > node.bbox_uy) {
+        if (node.bbox.lx > node.bbox.ux || node.bbox.ly > node.bbox.uy) {
             err = "Tree node has invalid bbox";
             return false;
         }
-        if (node.is_leaf) {
+        if (node.is_sink) {
             ++leaf_count;
             if (node.sink_index < 0 ||
                 static_cast<std::size_t>(node.sink_index) >= problem.sinks.size()) {
                 err = "Leaf node has invalid sink index";
                 return false;
             }
-            if (node.left != -1 || node.right != -1 || node.sink_count != 1) {
-                err = "Leaf node has invalid child or sink_count fields";
+            if (node.left != -1 || node.right != -1 || node.sink_indices.size() != 1) {
+                err = "Leaf node has invalid child or sink_indices fields";
+                return false;
+            }
+            if (node.kind != common::NodeKind::Sink) {
+                err = "Sink leaf node has non-SINK kind";
                 return false;
             }
         } else {
-            if (node.left < 0 || node.right < 0 || node.left == node.right ||
+            const bool unary_access = node.kind == common::NodeKind::ClusterAccess &&
+                                      node.left >= 0 &&
+                                      node.right == -1;
+            if (node.left < 0 ||
+                (!unary_access && node.right < 0) ||
+                (!unary_access && node.left == node.right) ||
                 static_cast<std::size_t>(node.left) >= tree.nodes.size() ||
-                static_cast<std::size_t>(node.right) >= tree.nodes.size()) {
+                (!unary_access && static_cast<std::size_t>(node.right) >= tree.nodes.size())) {
                 err = "Internal node has invalid children";
                 return false;
             }
-            const common::TreeNode& left =
-                tree.nodes[static_cast<std::size_t>(node.left)];
-            const common::TreeNode& right =
-                tree.nodes[static_cast<std::size_t>(node.right)];
-            if (left.parent != node.id || right.parent != node.id) {
+            const common::TopoNode& left = tree.nodes[static_cast<std::size_t>(node.left)];
+            if (left.parent != node.id) {
                 err = "Child parent pointer mismatch";
                 return false;
             }
-            if (node.sink_count != left.sink_count + right.sink_count) {
-                err = "Internal node sink_count mismatch";
+            common::BBox child_union = left.bbox;
+            if (!unary_access) {
+                const common::TopoNode& right = tree.nodes[static_cast<std::size_t>(node.right)];
+                if (right.parent != node.id) {
+                    err = "Child parent pointer mismatch";
+                    return false;
+                }
+                child_union = union_bbox(left.bbox, right.bbox);
+            }
+            if (node.bbox.lx != child_union.lx ||
+                node.bbox.ly != child_union.ly ||
+                node.bbox.ux != child_union.ux ||
+                node.bbox.uy != child_union.uy) {
+                err = "Internal node bbox does not match union of children bboxes";
                 return false;
             }
-            const BBox child_union = union_node_bbox(left, right);
-            if (node.bbox_lx != child_union.lx ||
-                node.bbox_ly != child_union.ly ||
-                node.bbox_ux != child_union.ux ||
-                node.bbox_uy != child_union.uy) {
-                err = "Internal node bbox does not match union of children bboxes";
+            if (node.kind == common::NodeKind::Sink) {
+                err = "Internal node has SINK kind";
                 return false;
             }
         }
@@ -622,14 +410,8 @@ static bool validate_tree(const common::TopologyTree& tree,
     std::vector<int> sink_seen(problem.sinks.size(), 0);
     std::vector<int> root_sinks;
     int reachable_nodes = 0;
-    if (!collect_subtree_sinks(tree.root,
-                               tree,
-                               problem,
-                               node_state,
-                               sink_seen,
-                               reachable_nodes,
-                               root_sinks,
-                               err)) {
+    if (!collect_subtree_sinks(tree.root, tree, problem, node_state, sink_seen,
+                               reachable_nodes, root_sinks, err)) {
         return false;
     }
     if (reachable_nodes != static_cast<int>(tree.nodes.size())) {
@@ -649,25 +431,84 @@ static bool validate_tree(const common::TopologyTree& tree,
     return true;
 }
 
+struct BuildContext {
+    const common::Problem& problem;
+    const common::PartitionTree& partition_tree;
+    common::TopoTree& global;
+    std::vector<int> partition_to_topo_root;
+};
+
+static int build_partition_topology(BuildContext& ctx,
+                                    int pid,
+                                    common::Point external_target) {
+    if (pid < 0 || static_cast<std::size_t>(pid) >= ctx.partition_tree.nodes.size()) {
+        ctx.global.error_msg = "Partition node id out of range";
+        return -1;
+    }
+    const common::PartitionNode& pnode =
+        ctx.partition_tree.nodes[static_cast<std::size_t>(pid)];
+
+    if (pnode.is_leaf || pnode.children.empty()) {
+        common::TopoTree local =
+            partreer::build(ctx.problem, pnode.sink_indices, external_target);
+        if (!local.valid) {
+            ctx.global.error_msg = "Partreer failed at partition node " +
+                                   std::to_string(pid) + ": " + local.error_msg;
+            return -1;
+        }
+        const int root = append_local_tree(ctx.global, local);
+        ctx.partition_to_topo_root[static_cast<std::size_t>(pid)] = root;
+        if (g_debug_enabled) {
+            std::cout << "[TREER] leaf partition " << pid << " sinks=";
+            for (int si : pnode.sink_indices) std::cout << si << " ";
+            std::cout << "cluster_root=" << root << "\n";
+        }
+        return root;
+    }
+
+    std::vector<int> child_roots;
+    for (int child_pid : pnode.children) {
+        common::Point child_target = pnode.centroid;
+        int child_root = build_partition_topology(ctx, child_pid, child_target);
+        if (child_root < 0) return -1;
+        child_roots.push_back(child_root);
+    }
+
+    int root = merge_child_roots(child_roots, external_target, ctx.global, ctx.problem);
+    ctx.partition_to_topo_root[static_cast<std::size_t>(pid)] = root;
+    if (g_debug_enabled) {
+        std::cout << "[TREER] internal partition " << pid << " child_roots=";
+        for (int r : child_roots) std::cout << r << " ";
+        std::cout << "root=" << root << "\n";
+    }
+    return root;
+}
+
 }  // namespace
 
 void debug_enable(bool enable) {
     g_debug_enabled = enable;
+    partreer::debug_enable(enable);
 }
 
-void debug_output(const TopologyTree& tree, const common::Problem& problem) {
-    if (!g_debug_enabled) {
-        return;
-    }
-
+void debug_output(const TopoTree& tree, const common::Problem& problem) {
+    if (!g_debug_enabled) return;
     std::cout << "TREER_DEBUG\n";
     std::cout << "VALID " << (tree.valid ? 1 : 0) << "\n";
     std::cout << "ERROR_MSG " << tree.error_msg << "\n";
     std::cout << "ROOT " << tree.root << "\n";
     std::cout << "NUM_NODES " << tree.nodes.size() << "\n";
-    for (const common::TreeNode& node : tree.nodes) {
+    int sinks = 0;
+    int cluster_internal = 0;
+    int cluster_access = 0;
+    int global = 0;
+    for (const common::TopoNode& node : tree.nodes) {
+        if (node.kind == common::NodeKind::Sink) ++sinks;
+        if (node.kind == common::NodeKind::ClusterInternal) ++cluster_internal;
+        if (node.kind == common::NodeKind::ClusterAccess) ++cluster_access;
+        if (node.kind == common::NodeKind::Global) ++global;
         write_node_line(std::cout, node);
-        if (node.is_leaf &&
+        if (node.is_sink &&
             node.sink_index >= 0 &&
             static_cast<std::size_t>(node.sink_index) < problem.sinks.size()) {
             const common::Sink& sink = problem.sinks[static_cast<std::size_t>(node.sink_index)];
@@ -675,87 +516,76 @@ void debug_output(const TopologyTree& tree, const common::Problem& problem) {
                       << sink.loc.x << " " << sink.loc.y << "\n";
         }
     }
+    std::cout << "KIND_STATS SINK " << sinks
+              << " CLUSTER_INTERNAL " << cluster_internal
+              << " CLUSTER_ACCESS " << cluster_access
+              << " GLOBAL " << global << "\n";
     std::cout << "END_TREER_DEBUG\n";
 }
 
-void debug_output_file(const TopologyTree& tree,
+void debug_output_file(const TopoTree& tree,
                        const common::Problem& problem,
                        const std::string& input_path) {
-    if (!g_debug_enabled) {
-        return;
+    if (!ensure_tree_dir()) return;
+    const std::string path = output_path_for(input_path);
+    write_tree_file(tree, problem, path);
+    if (g_debug_enabled) {
+        std::cout << "[TREER] wrote topology output to " << path << "\n";
     }
-    if (!ensure_tree_dir()) {
-        return;
-    }
-
-    const std::string output_path = "tree/" + get_basename(input_path);
-    write_tree_file(tree, problem, output_path);
 }
 
-TopologyTree build(const common::Problem& problem, const std::string& input_path) {
-    TopologyTree tree;
+TopoTree build(const common::Problem& problem,
+               const common::PartitionTree& partition_tree,
+               const std::string& sample_name_or_input_path) {
+    TopoTree tree;
     if (!problem.valid) {
         tree.error_msg = "Cannot build topology from invalid problem: " + problem.error_msg;
+        debug_output_file(tree, problem, sample_name_or_input_path);
+        return tree;
+    }
+    if (!partition_tree.valid) {
+        tree.error_msg = "Cannot build topology from invalid partition tree: " +
+                         partition_tree.error_msg;
+        debug_output_file(tree, problem, sample_name_or_input_path);
         return tree;
     }
     if (problem.sinks.empty()) {
         tree.error_msg = "Cannot build topology with zero sinks";
+        debug_output_file(tree, problem, sample_name_or_input_path);
         return tree;
     }
 
-    const std::size_t num_sinks = problem.sinks.size();
+    tree.nodes.reserve(problem.sinks.size() * 2U + partition_tree.nodes.size() * 2U);
+    BuildContext ctx{problem,
+                     partition_tree,
+                     tree,
+                     std::vector<int>(partition_tree.nodes.size(), -1)};
 
-    if (num_sinks == 1) {
-        const int leaf_id = 0;
-        tree.nodes.push_back(make_leaf(leaf_id, 0, problem.sinks[0], problem));
-        tree.root = leaf_id;
-        tree.valid = true;
-
-        if (g_debug_enabled) {
-            debug_output(tree, problem);
-            debug_output_file(tree, problem, input_path);
-        }
+    const int root = build_partition_topology(ctx, partition_tree.root, problem.source.loc);
+    if (root < 0) {
+        debug_output_file(tree, problem, sample_name_or_input_path);
         return tree;
     }
 
-    tree.nodes.reserve(num_sinks * 2U - 1U);
-
-    std::vector<int> active;
-    active.reserve(num_sinks);
-    for (std::size_t i = 0; i < num_sinks; ++i) {
-        const int leaf_id = static_cast<int>(tree.nodes.size());
-        tree.nodes.push_back(make_leaf(
-            leaf_id,
-            static_cast<int>(i),
-            problem.sinks[i],
-            problem));
-        active.push_back(leaf_id);
-    }
-
-    while (active.size() > 1) {
-        std::vector<int> new_active = rgm_round(active, problem, tree);
-        if (new_active.size() >= active.size()) {
-            tree.error_msg = "RGM round failed to reduce active cluster count";
-            return tree;
-        }
-        active = std::move(new_active);
-    }
-
-    tree.root = active[0];
-    tree.nodes[static_cast<std::size_t>(tree.root)].parent = -1;
+    tree.root = root;
+    tree.cluster_root = root;
+    tree.nodes[static_cast<std::size_t>(root)].parent = -1;
     tree.valid = true;
 
     std::string err;
     if (!validate_tree(tree, problem, err)) {
         tree.valid = false;
         tree.error_msg = err;
-        return tree;
     }
 
     if (g_debug_enabled) {
+        std::cout << "[TREER] partition->topo root mapping\n";
+        for (std::size_t i = 0; i < ctx.partition_to_topo_root.size(); ++i) {
+            std::cout << "  " << i << " -> " << ctx.partition_to_topo_root[i] << "\n";
+        }
         debug_output(tree, problem);
-        debug_output_file(tree, problem, input_path);
     }
+    debug_output_file(tree, problem, sample_name_or_input_path);
     return tree;
 }
 

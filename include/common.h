@@ -32,37 +32,60 @@ struct Problem {
     std::string error_msg;
 };
 
-struct TreeNode {
-    int id = -1;
+struct BBox {
+    int lx = 0;
+    int ly = 0;
+    int ux = 0;
+    int uy = 0;
+};
 
-    bool is_leaf = false;
-    int sink_index = -1;
+enum class NodeKind {
+    Sink,
+    ClusterInternal,
+    ClusterAccess,
+    Global
+};
+
+struct TopoNode {
+    int id = -1;
+    Point loc;
 
     int parent = -1;
     int left = -1;
     int right = -1;
 
-    int sink_count = 0;
+    bool is_sink = false;
+    int sink_index = -1;
 
-    double cx = 0.0;
-    double cy = 0.0;
+    std::vector<int> sink_indices;
+    BBox bbox;
 
-    int bbox_lx = 0;
-    int bbox_ly = 0;
-    int bbox_ux = 0;
-    int bbox_uy = 0;
+    int left_min_delay_to_node = 0;
+    int left_max_delay_to_node = 0;
+    int left_skew_to_node = 0;
 
+    int right_min_delay_to_node = 0;
+    int right_max_delay_to_node = 0;
+    int right_skew_to_node = 0;
+
+    int subtree_min_delay_to_node = 0;
+    int subtree_max_delay_to_node = 0;
+    int subtree_skew_to_node = 0;
+
+    // Region is kept for the BU/TD stages, which use it as a geometric
+    // feasibility hint after topology construction.
     int region_lx = 0;
     int region_ly = 0;
     int region_ux = 0;
     int region_uy = 0;
 
-    double est_delay = 0.0;
+    NodeKind kind = NodeKind::ClusterInternal;
 };
 
-struct TopologyTree {
-    std::vector<TreeNode> nodes;
+struct TopoTree {
+    std::vector<TopoNode> nodes;
     int root = -1;
+    int cluster_root = -1;
     bool valid = false;
     std::string error_msg;
 };
