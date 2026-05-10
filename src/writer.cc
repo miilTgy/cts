@@ -121,7 +121,7 @@ static bool ensure_result_dir(std::string& err) {
 }
 
 static bool validate_global_inputs(const common::Problem& problem,
-                                   const common::TopologyTree& tree,
+                                   const common::TopoTree& tree,
                                    const common::BottomUpResult& bu_result,
                                    const common::TopDownResult& td_result,
                                    std::string& err) {
@@ -172,7 +172,7 @@ static bool validate_global_inputs(const common::Problem& problem,
 }
 
 static bool build_rounded_locs(const common::Problem& problem,
-                               const common::TopologyTree& tree,
+                               const common::TopoTree& tree,
                                const common::TopDownResult& td_result,
                                std::vector<IntPoint>& rounded_locs,
                                std::string& err) {
@@ -206,7 +206,7 @@ static bool build_rounded_locs(const common::Problem& problem,
 }
 
 static bool collect_buffers(const common::Problem& problem,
-                            const common::TopologyTree& tree,
+                            const common::TopoTree& tree,
                             const common::TopDownResult& td_result,
                             const std::vector<IntPoint>& rounded_locs,
                             std::vector<OutputBuffer>& buffers,
@@ -230,7 +230,7 @@ static bool collect_buffers(const common::Problem& problem,
         }
         const common::BufferType& type =
             problem.buffer_types[static_cast<std::size_t>(type_index)];
-        if (tree.nodes[i].sink_count > type.max_fanout) {
+        if (static_cast<int>(tree.nodes[i].sink_indices.size()) > type.max_fanout) {
             err = "Buffer fanout violation at node " + std::to_string(i);
             return false;
         }
@@ -252,16 +252,16 @@ static bool collect_buffers(const common::Problem& problem,
     return true;
 }
 
-static int find_leaf_for_sink(const common::TopologyTree& tree, int sink_index) {
+static int find_leaf_for_sink(const common::TopoTree& tree, int sink_index) {
     for (std::size_t i = 0; i < tree.nodes.size(); ++i) {
-        if (tree.nodes[i].is_leaf && tree.nodes[i].sink_index == sink_index) {
+        if (tree.nodes[i].is_sink && tree.nodes[i].sink_index == sink_index) {
             return static_cast<int>(i);
         }
     }
     return -1;
 }
 
-static bool build_node_path(const common::TopologyTree& tree,
+static bool build_node_path(const common::TopoTree& tree,
                             int leaf,
                             std::vector<int>& path,
                             std::string& err) {
@@ -375,7 +375,7 @@ static bool validate_route(const common::Problem& problem,
 }
 
 static bool build_routes(const common::Problem& problem,
-                         const common::TopologyTree& tree,
+                         const common::TopoTree& tree,
                          const common::TopDownResult& td_result,
                          const std::vector<IntPoint>& rounded_locs,
                          std::vector<OutputRoute>& routes,
@@ -462,7 +462,7 @@ void debug_enable(bool enable) {
 
 WriterResult write_solution(const std::string& input_path,
                             const common::Problem& problem,
-                            const common::TopologyTree& tree,
+                            const common::TopoTree& tree,
                             const common::BottomUpResult& bu_result,
                             const common::TopDownResult& td_result) {
     WriterResult result;
@@ -495,7 +495,7 @@ WriterResult write_solution(const std::string& input_path,
                       << " node=" << buffer.tree_node_id
                       << " loc=" << point_to_string(buffer.loc)
                       << " fanout="
-                      << tree.nodes[static_cast<std::size_t>(buffer.tree_node_id)].sink_count
+                      << tree.nodes[static_cast<std::size_t>(buffer.tree_node_id)].sink_indices.size()
                       << "\n";
         }
         std::cout << "[Writer] num_routes=" << routes.size() << "\n";

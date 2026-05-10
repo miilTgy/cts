@@ -16,7 +16,7 @@ void debug_enable(bool enable);
 
 WriterResult write_solution(const std::string& input_path,
                             const common::Problem& problem,
-                            const common::TopologyTree& tree,
+                            const common::TopoTree& tree,
                             const common::BottomUpResult& bu_result,
                             const common::TopDownResult& td_result);
 

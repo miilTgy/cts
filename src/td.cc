@@ -769,7 +769,7 @@ static std::vector<common::SegmentPoint> merge_base_route_and_compensation(
 
 static bool is_valid_buffer_choice(const common::BufferChoice& choice,
                                    const common::Problem& problem,
-                                   const common::TreeNode& child,
+                                   const common::TopoNode& child,
                                    std::string& err) {
     if (!choice.has_buffer) {
         if (choice.buffer_type_index != -1) {
@@ -778,7 +778,7 @@ static bool is_valid_buffer_choice(const common::BufferChoice& choice,
         }
         return true;
     }
-    if (child.is_leaf) {
+    if (child.is_sink) {
         err = "Leaf node has a buffer marker from BU";
         return false;
     }
@@ -848,18 +848,18 @@ static bool validate_bu_node(const common::BottomUpNodeResult& node_result,
 
 static bool validate_tree_node_shape(int node_id,
                                      const common::Problem& problem,
-                                     const common::TopologyTree& tree,
+                                     const common::TopoTree& tree,
                                      std::string& err) {
     if (node_id < 0 || static_cast<std::size_t>(node_id) >= tree.nodes.size()) {
         err = "Tree node id out of range";
         return false;
     }
-    const common::TreeNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
+    const common::TopoNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
     if (node.id != node_id) {
         err = "Tree node id does not match vector index";
         return false;
     }
-    if (node.is_leaf) {
+    if (node.is_sink) {
         if (node.sink_index < 0 ||
             static_cast<std::size_t>(node.sink_index) >= problem.sinks.size()) {
             err = "Leaf node " + std::to_string(node_id) + " has invalid sink index";
@@ -881,7 +881,7 @@ static BranchCandidate build_branch_candidate(
     int child_id,
     bool is_left_child,
     const common::Problem& problem,
-    const common::TopologyTree& tree,
+    const common::TopoTree& tree,
     const common::BottomUpResult& bu_result,
     const common::TopDownResult& result,
     std::string& err) {
@@ -893,7 +893,7 @@ static BranchCandidate build_branch_candidate(
         bu_result.node_results[static_cast<std::size_t>(parent_id)];
     const common::BottomUpNodeResult& child_bu =
         bu_result.node_results[static_cast<std::size_t>(child_id)];
-    const common::TreeNode& child_node = tree.nodes[static_cast<std::size_t>(child_id)];
+    const common::TopoNode& child_node = tree.nodes[static_cast<std::size_t>(child_id)];
 
     if (!validate_bu_node(parent_bu, parent_id, err) ||
         !validate_bu_node(child_bu, child_id, err)) {
@@ -931,10 +931,10 @@ static BranchCandidate build_branch_candidate(
         err = "TD generated no candidate locations for child " + std::to_string(child_id);
         return branch;
     }
-    branch.allowed_parent_sink = tree.nodes[static_cast<std::size_t>(parent_id)].is_leaf
+    branch.allowed_parent_sink = tree.nodes[static_cast<std::size_t>(parent_id)].is_sink
                                      ? tree.nodes[static_cast<std::size_t>(parent_id)].sink_index
                                      : -1;
-    branch.allowed_child_sink = child_node.is_leaf ? child_node.sink_index : -1;
+    branch.allowed_child_sink = child_node.is_sink ? child_node.sink_index : -1;
     branch.route = route_to_best_candidate_loc_dag(parent_loc, candidates, problem.sinks,
                                                    branch.allowed_parent_sink,
                                                    branch.allowed_child_sink,
@@ -953,13 +953,13 @@ static bool write_branch_result(int parent_id,
                                 const BranchCandidate& branch,
                                 double common_extra,
                                 const common::Problem& problem,
-                                const common::TopologyTree& tree,
+                                const common::TopoTree& tree,
                                 const common::BottomUpResult& bu_result,
                                 common::TopDownResult& result,
                                 std::string& err) {
     const common::BottomUpNodeResult& child_bu =
         bu_result.node_results[static_cast<std::size_t>(branch.child_id)];
-    const common::TreeNode& child_node =
+    const common::TopoNode& child_node =
         tree.nodes[static_cast<std::size_t>(branch.child_id)];
     const double child_extra = result.node_results[static_cast<std::size_t>(branch.child_id)].valid
                                    ? result.node_results[static_cast<std::size_t>(branch.child_id)].td_common_extra_delay
@@ -1053,7 +1053,7 @@ static bool write_branch_result(int parent_id,
               std::to_string(branch.child_id);
         return false;
     }
-    if (child_node.is_leaf && out.has_buffer) {
+    if (child_node.is_sink && out.has_buffer) {
         err = "TD cannot place a buffer on leaf child " +
               std::to_string(branch.child_id);
         return false;
@@ -1068,7 +1068,7 @@ static bool place_sibling_pair_with_balancing(
     int left_id,
     int right_id,
     const common::Problem& problem,
-    const common::TopologyTree& tree,
+    const common::TopoTree& tree,
     const common::BottomUpResult& bu_result,
     common::TopDownResult& result,
     std::string& err) {
@@ -1148,11 +1148,11 @@ static bool place_sibling_pair_with_balancing(
 
 static bool check_bu_delay_consistency(int parent_id,
                                        const common::Problem& problem,
-                                       const common::TopologyTree& tree,
+                                       const common::TopoTree& tree,
                                        const common::BottomUpResult& bu_result,
                                        std::string& err) {
-    const common::TreeNode& parent = tree.nodes[static_cast<std::size_t>(parent_id)];
-    if (parent.is_leaf) {
+    const common::TopoNode& parent = tree.nodes[static_cast<std::size_t>(parent_id)];
+    if (parent.is_sink) {
         return true;
     }
     const common::BottomUpNodeResult& parent_bu =
@@ -1187,7 +1187,7 @@ static bool check_bu_delay_consistency(int parent_id,
 
 static bool place_node_recursive(int node_id,
                                  const common::Problem& problem,
-                                 const common::TopologyTree& tree,
+                                 const common::TopoTree& tree,
                                  const common::BottomUpResult& bu_result,
                                  common::TopDownResult& result,
                                  std::vector<int>& state,
@@ -1212,8 +1212,8 @@ static bool place_node_recursive(int node_id,
     if (!check_bu_delay_consistency(node_id, problem, tree, bu_result, err)) {
         return false;
     }
-    const common::TreeNode& node = tree.nodes[idx];
-    if (!node.is_leaf) {
+    const common::TopoNode& node = tree.nodes[idx];
+    if (!node.is_sink) {
         if (!place_sibling_pair_with_balancing(node_id, node.left, node.right, problem, tree, bu_result,
                                                result, err) ||
             !place_node_recursive(node.left, problem, tree, bu_result, result,
@@ -1243,7 +1243,7 @@ static bool validate_all_nodes_visited(const std::vector<int>& state,
 static bool validate_td_node(const common::TopDownNodeResult& node_result,
                              int expected_node_id,
                              const common::Problem& problem,
-                             const common::TopologyTree& tree,
+                             const common::TopoTree& tree,
                              std::string& err) {
     if (!node_result.valid) {
         err = "TD result for node " + std::to_string(expected_node_id) + " is invalid";
@@ -1287,10 +1287,10 @@ static bool validate_td_node(const common::TopDownNodeResult& node_result,
         const common::SegmentPoint& parent_loc =
             node_result.final_route_to_parent.front();
         (void)parent_loc;
-        const int allowed_parent_sink = tree.nodes[static_cast<std::size_t>(parent_id)].is_leaf
+        const int allowed_parent_sink = tree.nodes[static_cast<std::size_t>(parent_id)].is_sink
                                             ? tree.nodes[static_cast<std::size_t>(parent_id)].sink_index
                                             : -1;
-        const int allowed_child_sink = tree.nodes[static_cast<std::size_t>(expected_node_id)].is_leaf
+        const int allowed_child_sink = tree.nodes[static_cast<std::size_t>(expected_node_id)].is_sink
                                            ? tree.nodes[static_cast<std::size_t>(expected_node_id)].sink_index
                                            : -1;
         const common::SegmentPoint expected_parent_loc =
@@ -1353,7 +1353,7 @@ void debug_enable(bool enable) {
 
 void debug_output(const TopDownResult& result,
                   const common::Problem& problem,
-                  const common::TopologyTree& tree,
+                  const common::TopoTree& tree,
                   const common::BottomUpResult& bu_result) {
     if (!g_debug_enabled) {
         return;
@@ -1367,7 +1367,7 @@ void debug_output(const TopDownResult& result,
         if (i >= tree.nodes.size() || i >= bu_result.node_results.size()) {
             continue;
         }
-        const common::TreeNode& tree_node = tree.nodes[i];
+        const common::TopoNode& tree_node = tree.nodes[i];
         const common::TopDownNodeResult& td_node = result.node_results[i];
         const common::BottomUpNodeResult& bu_node = bu_result.node_results[i];
 
@@ -1375,9 +1375,9 @@ void debug_output(const TopDownResult& result,
                   << " parent=" << tree_node.parent
                   << " left=" << tree_node.left
                   << " right=" << tree_node.right
-                  << " is_leaf=" << (tree_node.is_leaf ? 1 : 0)
+                  << " is_leaf=" << (tree_node.is_sink ? 1 : 0)
                   << " sink_index=" << tree_node.sink_index
-                  << " sink_count=" << tree_node.sink_count << "\n";
+                  << " sink_count=" << tree_node.sink_indices.size() << "\n";
         if (!td_node.valid) {
             std::cout << "[TD]   td_result=INVALID\n";
             continue;
@@ -1418,7 +1418,7 @@ void debug_output(const TopDownResult& result,
 }
 
 TopDownResult run(const common::Problem& problem,
-                  const common::TopologyTree& tree,
+                  const common::TopoTree& tree,
                   const common::BottomUpResult& bu_result) {
     TopDownResult result;
     if (!problem.valid) {

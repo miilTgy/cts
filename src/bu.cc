@@ -523,15 +523,15 @@ static int buffer_cost(const common::Problem& problem,
 
 static std::vector<common::BufferChoice> buffer_options(
     const common::Problem& problem,
-    const common::TreeNode& child) {
+    const common::TopoNode& child) {
     std::vector<common::BufferChoice> options;
     options.push_back(common::BufferChoice{});
-    if (child.is_leaf) {
+    if (child.is_sink) {
         return options;
     }
     for (std::size_t i = 0; i < problem.buffer_types.size(); ++i) {
         const common::BufferType& buf = problem.buffer_types[i];
-        if (buf.max_fanout >= child.sink_count) {
+        if (buf.max_fanout >= static_cast<int>(child.sink_indices.size())) {
             common::BufferChoice choice;
             choice.has_buffer = true;
             choice.buffer_type_index = static_cast<int>(i);
@@ -576,10 +576,10 @@ static bool validate_node_result(const common::BottomUpNodeResult& node,
 
 static bool solve_leaf(int node_id,
                        const common::Problem& problem,
-                       const common::TopologyTree& tree,
+                       const common::TopoTree& tree,
                        common::BottomUpResult& result,
                        std::string& err) {
-    const common::TreeNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
+    const common::TopoNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
     if (node.sink_index < 0 ||
         static_cast<std::size_t>(node.sink_index) >= problem.sinks.size()) {
         err = "Leaf node has invalid sink index";
@@ -598,10 +598,10 @@ static bool solve_leaf(int node_id,
 
 static bool solve_internal(int node_id,
                            const common::Problem& problem,
-                           const common::TopologyTree& tree,
+                           const common::TopoTree& tree,
                            common::BottomUpResult& result,
                            std::string& err) {
-    const common::TreeNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
+    const common::TopoNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
     const int left_id = node.left;
     const int right_id = node.right;
     if (left_id < 0 || right_id < 0 || left_id == right_id ||
@@ -707,7 +707,7 @@ static bool solve_internal(int node_id,
 
 static bool solve_node(int node_id,
                        const common::Problem& problem,
-                       const common::TopologyTree& tree,
+                       const common::TopoTree& tree,
                        common::BottomUpResult& result,
                        std::vector<int>& state,
                        std::string& err) {
@@ -725,9 +725,9 @@ static bool solve_node(int node_id,
     }
 
     state[idx] = 1;
-    const common::TreeNode& node = tree.nodes[idx];
+    const common::TopoNode& node = tree.nodes[idx];
     bool ok = false;
-    if (node.is_leaf) {
+    if (node.is_sink) {
         ok = solve_leaf(node_id, problem, tree, result, err);
     } else {
         if (node.left < 0 || node.right < 0 || node.left == node.right ||
@@ -773,7 +773,7 @@ void debug_enable(bool enable) {
 
 void debug_output(const BottomUpResult& result,
                   const common::Problem& problem,
-                  const common::TopologyTree& tree) {
+                  const common::TopoTree& tree) {
     if (!g_debug_enabled) {
         return;
     }
@@ -787,15 +787,15 @@ void debug_output(const BottomUpResult& result,
         if (i >= tree.nodes.size()) {
             continue;
         }
-        const common::TreeNode& node = tree.nodes[i];
+        const common::TopoNode& node = tree.nodes[i];
         std::cout << "[BU] node_id=" << node.id
                   << " parent=" << node.parent
                   << " left=" << node.left
                   << " right=" << node.right
-                  << " is_leaf=" << (node.is_leaf ? 1 : 0)
+                  << " is_leaf=" << (node.is_sink ? 1 : 0)
                   << " sink_index=" << node.sink_index
-                  << " sink_count=" << node.sink_count << "\n";
-        if (node.is_leaf &&
+                  << " sink_count=" << node.sink_indices.size() << "\n";
+        if (node.is_sink &&
             node.sink_index >= 0 &&
             static_cast<std::size_t>(node.sink_index) < problem.sinks.size()) {
             const common::Sink& sink =
@@ -827,7 +827,7 @@ void debug_output(const BottomUpResult& result,
 }
 
 BottomUpResult run(const common::Problem& problem,
-                   const common::TopologyTree& tree) {
+                   const common::TopoTree& tree) {
     BottomUpResult result;
     if (!problem.valid) {
         result.error_msg = "Cannot run BU on invalid problem: " + problem.error_msg;
