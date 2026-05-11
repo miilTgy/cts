@@ -319,4 +319,32 @@ struct RouterResult {
     std::vector<RouterEdgeDebug> edge_debugs;
 };
 
+struct DetourRecord {
+    int edge_id = -1;
+    int node_parent = -1;
+    int node_child = -1;
+    int segment_index = -1;
+    int anchor_index = -1;
+    int level = 1;
+    int added_delay = 2;
+    std::string side;
+    bool upgraded = false;
+};
+
+struct DetourNodeResult {
+    int node_id = -1;
+    bool valid = false;
+    std::vector<double> sink_delays_to_node;
+    double min_sink_delay_to_node = 0.0;
+    double max_sink_delay_to_node = 0.0;
+    double skew_to_node = 0.0;
+};
+
+struct DetourerResult {
+    bool valid = false;
+    std::string error_msg;
+    std::vector<DetourRecord> detour_records;
+    std::vector<DetourNodeResult> node_results;
+};
+
 }  // namespace common

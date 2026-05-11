@@ -8,6 +8,7 @@
 #include "td.h"
 #include "locer.h"
 #include "router.h"
+#include "detourer.h"
 #include "writer.h"
 #include "partitioner.h"
 
@@ -26,6 +27,8 @@ int main(int argc, char** argv) {
     locer::debug_file_enable(true);
     router::debug_enable(true);
     router::debug_file_enable(true);
+    detourer::debug_enable(true);
+    detourer::debug_file_enable(true);
     writer::debug_enable(true);
 
     common::Problem problem = parser::parse(argv[1]);
@@ -60,6 +63,13 @@ int main(int argc, char** argv) {
     }
     if (!route_result.output_path.empty()) {
         std::cout << "Router: wrote " << route_result.output_path << "\n";
+    }
+
+    common::DetourerResult detour_result =
+        detourer::run(problem, tree, loc_result, route_result, argv[1]);
+    if (!detour_result.valid) {
+        std::cerr << "DETOURER error: " << detour_result.error_msg << "\n";
+        return 1;
     }
 
     writer::WriterResult writer_result =
