@@ -149,6 +149,13 @@ struct PointKeyHash {
     }
 };
 
+struct RouteSegment {
+    ScaledPoint a;
+    ScaledPoint b;
+    Policy policy = Policy::Unknown;
+    int cluster_top = -1;
+};
+
 struct AStarNode {
     ScaledState state;
     long long g = 0;
@@ -407,6 +414,20 @@ static bool is_preferred_dir(const common::TopoNode& node, Dir dir) {
     return dir == Dir::Up || dir == Dir::Down;
 }
 
+static Dir dominant_dir_between(const ScaledPoint& from,
+                                const ScaledPoint& to) {
+    const long long dx = to.x - from.x;
+    const long long dy = to.y - from.y;
+    if (std::llabs(dx) >= std::llabs(dy)) {
+        if (dx > 0) return Dir::Right;
+        if (dx < 0) return Dir::Left;
+    } else {
+        if (dy > 0) return Dir::Up;
+        if (dy < 0) return Dir::Down;
+    }
+    return Dir::None;
+}
+
 static ScaledBBox scaled_bbox(const common::BBox& bbox, int scale) {
     return ScaledBBox{
         static_cast<long long>(bbox.lx) * scale,
@@ -471,6 +492,35 @@ static bool point_strictly_inside_bbox(const ScaledPoint& p,
     return bbox.valid &&
            p.x > bbox.lx && p.x < bbox.ux &&
            p.y > bbox.ly && p.y < bbox.uy;
+}
+
+static ScaledBBox expand_bbox_to_point(ScaledBBox bbox,
+                                       const ScaledPoint& p,
+                                       long long margin) {
+    if (!bbox.valid) {
+        bbox.lx = bbox.ux = p.x;
+        bbox.ly = bbox.uy = p.y;
+        bbox.valid = true;
+    }
+    bbox.lx = std::min(bbox.lx, p.x - margin);
+    bbox.ly = std::min(bbox.ly, p.y - margin);
+    bbox.ux = std::max(bbox.ux, p.x + margin);
+    bbox.uy = std::max(bbox.uy, p.y + margin);
+    return bbox;
+}
+
+static ScaledBBox clamp_bbox_to_die(ScaledBBox bbox,
+                                    int die_width,
+                                    int die_height,
+                                    int scale) {
+    if (!bbox.valid) {
+        return bbox;
+    }
+    bbox.lx = std::max(0LL, bbox.lx);
+    bbox.ly = std::max(0LL, bbox.ly);
+    bbox.ux = std::min(static_cast<long long>(die_width) * scale, bbox.ux);
+    bbox.uy = std::min(static_cast<long long>(die_height) * scale, bbox.uy);
+    return bbox;
 }
 
 static long long segment_length_scaled(const ScaledPoint& a, const ScaledPoint& b) {
@@ -591,27 +641,162 @@ static bool point_forbidden_for_edge(
     return false;
 }
 
-static bool point_inside_other_bbox(const ScaledPoint& p,
-                                    const EdgeInfo& edge,
-                                    const std::vector<ScaledBBox>& node_bboxes,
-                                    const ScaledBBox* allowed_bbox) {
+static bool point_inside_forbidden_bbox(const ScaledPoint& p,
+                                        const EdgeInfo& edge,
+                                        const std::vector<ScaledBBox>& node_bboxes,
+                                        const std::vector<common::TopoNode>& topo_nodes) {
+    if (same_point(p, edge.start) || same_point(p, edge.goal)) {
+        return false;
+    }
     for (std::size_t i = 0; i < node_bboxes.size(); ++i) {
         if (static_cast<int>(i) == edge.parent || static_cast<int>(i) == edge.child) {
             continue;
         }
-        if (allowed_bbox != nullptr && node_bboxes[i].valid) {
-            const ScaledBBox& b = node_bboxes[i];
-            const bool disjoint = b.ux < allowed_bbox->lx || b.lx > allowed_bbox->ux ||
-                                  b.uy < allowed_bbox->ly || b.ly > allowed_bbox->uy;
-            if (!disjoint) {
-                continue;
-            }
+        if (static_cast<int>(i) == edge.cluster_top) {
+            continue;
+        }
+        if (i >= topo_nodes.size() ||
+            topo_nodes[i].kind != common::NodeKind::ClusterTop) {
+            continue;
         }
         if (point_strictly_inside_bbox(p, node_bboxes[i])) {
             return true;
         }
     }
     return false;
+}
+
+static bool point_on_segment(const ScaledPoint& p,
+                             const RouteSegment& s) {
+    if (!is_manhattan_segment(s.a, s.b)) {
+        return false;
+    }
+    if (s.a.x == s.b.x) {
+        return p.x == s.a.x &&
+               p.y >= std::min(s.a.y, s.b.y) &&
+               p.y <= std::max(s.a.y, s.b.y);
+    }
+    return p.y == s.a.y &&
+           p.x >= std::min(s.a.x, s.b.x) &&
+           p.x <= std::max(s.a.x, s.b.x);
+}
+
+static bool segment_endpoint(const ScaledPoint& p,
+                             const RouteSegment& s) {
+    return same_point(p, s.a) || same_point(p, s.b);
+}
+
+static bool segment_intersection_point(const RouteSegment& a,
+                                       const RouteSegment& b,
+                                       ScaledPoint& out) {
+    const bool a_h = a.a.y == a.b.y;
+    const bool a_v = a.a.x == a.b.x;
+    const bool b_h = b.a.y == b.b.y;
+    const bool b_v = b.a.x == b.b.x;
+    if (!((a_h || a_v) && (b_h || b_v))) {
+        return false;
+    }
+    if (a_h && b_v) {
+        const ScaledPoint p{b.a.x, a.a.y};
+        if (point_on_segment(p, a) && point_on_segment(p, b)) {
+            out = p;
+            return true;
+        }
+        return false;
+    }
+    if (a_v && b_h) {
+        const ScaledPoint p{a.a.x, b.a.y};
+        if (point_on_segment(p, a) && point_on_segment(p, b)) {
+            out = p;
+            return true;
+        }
+        return false;
+    }
+
+    if (a_h && b_h && a.a.y == b.a.y) {
+        const long long lo = std::max(std::min(a.a.x, a.b.x),
+                                      std::min(b.a.x, b.b.x));
+        const long long hi = std::min(std::max(a.a.x, a.b.x),
+                                      std::max(b.a.x, b.b.x));
+        if (lo > hi) {
+            return false;
+        }
+        out = ScaledPoint{lo, a.a.y};
+        return true;
+    }
+    if (a_v && b_v && a.a.x == b.a.x) {
+        const long long lo = std::max(std::min(a.a.y, a.b.y),
+                                      std::min(b.a.y, b.b.y));
+        const long long hi = std::min(std::max(a.a.y, a.b.y),
+                                      std::max(b.a.y, b.b.y));
+        if (lo > hi) {
+            return false;
+        }
+        out = ScaledPoint{a.a.x, lo};
+        return true;
+    }
+    return false;
+}
+
+static bool segments_overlap_with_length(const RouteSegment& a,
+                                         const RouteSegment& b) {
+    if (a.a.y == a.b.y && b.a.y == b.b.y && a.a.y == b.a.y) {
+        const long long lo = std::max(std::min(a.a.x, a.b.x),
+                                      std::min(b.a.x, b.b.x));
+        const long long hi = std::min(std::max(a.a.x, a.b.x),
+                                      std::max(b.a.x, b.b.x));
+        return lo < hi;
+    }
+    if (a.a.x == a.b.x && b.a.x == b.b.x && a.a.x == b.a.x) {
+        const long long lo = std::max(std::min(a.a.y, a.b.y),
+                                      std::min(b.a.y, b.b.y));
+        const long long hi = std::min(std::max(a.a.y, a.b.y),
+                                      std::max(b.a.y, b.b.y));
+        return lo < hi;
+    }
+    return false;
+}
+
+static bool allow_same_cluster_global_touch(const EdgeInfo& edge,
+                                            const RouteSegment& committed) {
+    if (edge.policy != Policy::GlobalPatternThenMaze ||
+        committed.policy == Policy::GlobalPatternThenMaze) {
+        return false;
+    }
+    if (edge.child_kind != common::NodeKind::ClusterTop) {
+        return false;
+    }
+    return edge.child >= 0 && committed.cluster_top == edge.child;
+}
+
+static bool point_on_allowed_same_cluster_route(
+    const ScaledPoint& p,
+    const EdgeInfo& edge,
+    const std::vector<RouteSegment>& committed_segments) {
+    for (const RouteSegment& committed : committed_segments) {
+        if (allow_same_cluster_global_touch(edge, committed) &&
+            point_on_segment(p, committed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<RouteSegment> polyline_segments(
+    const std::vector<ScaledPoint>& points,
+    Policy policy = Policy::Unknown,
+    int cluster_top = -1) {
+    std::vector<RouteSegment> segments;
+    if (points.size() < 2U) {
+        return segments;
+    }
+    segments.reserve(points.size() - 1U);
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        if (!same_point(points[i - 1U], points[i])) {
+            segments.push_back(RouteSegment{points[i - 1U], points[i], policy, cluster_top});
+        }
+    }
+    return segments;
 }
 
 static std::vector<ScaledPoint> expand_segment_points(const ScaledPoint& a,
@@ -638,10 +823,15 @@ static std::vector<ScaledPoint> expand_segment_points(const ScaledPoint& a,
 
 static void add_route_to_blocked(
     const std::vector<ScaledPoint>& polyline,
-    std::unordered_set<PointKey, PointKeyHash>& committed_points) {
+    const EdgeInfo& edge,
+    std::unordered_set<PointKey, PointKeyHash>& committed_points,
+    std::vector<RouteSegment>& committed_segments) {
     if (polyline.size() < 2U) {
         return;
     }
+    const std::vector<RouteSegment> segments =
+        polyline_segments(polyline, edge.policy, edge.cluster_top);
+    committed_segments.insert(committed_segments.end(), segments.begin(), segments.end());
     for (std::size_t i = 1; i < polyline.size(); ++i) {
         const std::vector<ScaledPoint> segment =
             expand_segment_points(polyline[i - 1U], polyline[i]);
@@ -677,11 +867,36 @@ static std::vector<long long> collect_track_values(
     values.insert(start + 1);
     values.insert(goal - 1);
     values.insert(goal + 1);
+    for (long long delta : {2LL, 3LL, 4LL, 6LL, 8LL}) {
+        values.insert(start - delta);
+        values.insert(start + delta);
+        values.insert(goal - delta);
+        values.insert(goal + delta);
+    }
+    if (edge.parent_is_source || edge.parent_kind == common::NodeKind::Global ||
+        edge.child_kind == common::NodeKind::Global) {
+        values.insert(start - 2);
+        values.insert(start + 2);
+        values.insert(goal - 2);
+        values.insert(goal + 2);
+    }
+    if (edge.cluster_top >= 0 &&
+        static_cast<std::size_t>(edge.cluster_top) < node_bboxes.size()) {
+        const ScaledBBox& bbox = node_bboxes[static_cast<std::size_t>(edge.cluster_top)];
+        const long long lo = x_axis ? bbox.lx : bbox.ly;
+        const long long hi = x_axis ? bbox.ux : bbox.uy;
+        values.insert(lo - 1);
+        values.insert(lo + 1);
+        values.insert(hi - 1);
+        values.insert(hi + 1);
+    }
     for (const ScaledPoint& p : node_points) {
         const long long v = x_axis ? p.x : p.y;
         values.insert(v);
-        values.insert(v - 1);
-        values.insert(v + 1);
+        for (long long delta : {1LL, 2LL, 3LL, 4LL}) {
+            values.insert(v - delta);
+            values.insert(v + delta);
+        }
     }
     for (const ScaledBBox& bbox : node_bboxes) {
         if (!bbox.valid) {
@@ -689,10 +904,12 @@ static std::vector<long long> collect_track_values(
         }
         const long long lo = x_axis ? bbox.lx : bbox.ly;
         const long long hi = x_axis ? bbox.ux : bbox.uy;
-        values.insert(lo - 1);
-        values.insert(lo + 1);
-        values.insert(hi - 1);
-        values.insert(hi + 1);
+        for (long long delta : {1LL, 2LL, 4LL}) {
+            values.insert(lo - delta);
+            values.insert(lo + delta);
+            values.insert(hi - delta);
+            values.insert(hi + delta);
+        }
         values.insert((lo + hi) / 2);
     }
     std::vector<long long> out;
@@ -827,19 +1044,19 @@ static Policy classify_policy(const EdgeInfo& edge) {
         edge.child_kind == common::NodeKind::Global) {
         return Policy::GlobalPatternThenMaze;
     }
-    const bool parent_is_external_anchor =
+    const auto is_access_bridge_top = [](common::NodeKind kind) {
+        return kind == common::NodeKind::ClusterAccess ||
+               kind == common::NodeKind::ClusterBridge ||
+               kind == common::NodeKind::ClusterTop;
+    };
+    const bool touches_top_or_bridge =
+        edge.parent_kind == common::NodeKind::ClusterTop ||
         edge.parent_kind == common::NodeKind::ClusterBridge ||
-        edge.parent_kind == common::NodeKind::ClusterTop;
-    const bool child_is_external_anchor =
-        edge.child_kind == common::NodeKind::ClusterBridge ||
-        edge.child_kind == common::NodeKind::ClusterTop;
-    const bool touches_access_or_bridge =
-        edge.parent_kind == common::NodeKind::ClusterAccess ||
-        edge.parent_kind == common::NodeKind::ClusterBridge ||
-        edge.child_kind == common::NodeKind::ClusterAccess ||
+        edge.child_kind == common::NodeKind::ClusterTop ||
         edge.child_kind == common::NodeKind::ClusterBridge;
-    if ((parent_is_external_anchor || child_is_external_anchor) &&
-        touches_access_or_bridge) {
+    if (is_access_bridge_top(edge.parent_kind) &&
+        is_access_bridge_top(edge.child_kind) &&
+        touches_top_or_bridge) {
         return Policy::ExternalAccessPatternThenMaze;
     }
     return Policy::LocalClusterPatternOnly;
@@ -874,6 +1091,8 @@ static Candidate run_maze_search(const EdgeInfo& edge,
                                  const std::vector<ScaledBBox>& node_bboxes,
                                  const ScaledPoint& source_point,
                                  const std::unordered_set<PointKey, PointKeyHash>& committed_points,
+                                 const std::vector<RouteSegment>& committed_segments,
+                                 const std::vector<common::TopoNode>& topo_nodes,
                                  const common::Problem& problem,
                                  int scale,
                                  const ScaledBBox* allowed_bbox,
@@ -889,8 +1108,28 @@ static Candidate run_maze_search(const EdgeInfo& edge,
     }
 
     auto blocked = [&](const ScaledPoint& p) {
-        return point_forbidden_for_edge(p, edge, node_points, source_point,
-                                        committed_points);
+        if (point_forbidden_for_edge(p, edge, node_points, source_point,
+                                     committed_points)) {
+            return true;
+        }
+        if (point_inside_forbidden_bbox(p, edge, node_bboxes, topo_nodes)) {
+            return true;
+        }
+        const RouteSegment step_segment{edge.start, p};
+        (void)step_segment;
+        for (const RouteSegment& committed : committed_segments) {
+            if (same_point(p, edge.start) || same_point(p, edge.goal)) {
+                continue;
+            }
+            if (allow_same_cluster_global_touch(edge, committed) &&
+                point_on_segment(p, committed)) {
+                continue;
+            }
+            if (point_on_segment(p, committed)) {
+                return true;
+            }
+        }
+        return false;
     };
 
     std::priority_queue<AStarNode, std::vector<AStarNode>, AStarCompare> pq;
@@ -953,7 +1192,7 @@ static Candidate run_maze_search(const EdgeInfo& edge,
             }
             if (edge.policy != Policy::LocalClusterPatternOnly &&
                 !same_point(next, edge.goal) &&
-                point_inside_other_bbox(next, edge, node_bboxes, allowed_bbox)) {
+                point_inside_forbidden_bbox(next, edge, node_bboxes, topo_nodes)) {
                 step_cost += std::max(1, bend_weight * 2);
             }
             const ScaledState next_state{next, dir};
@@ -1041,9 +1280,9 @@ static Shape shape_from_polyline(const std::vector<ScaledPoint>& points) {
         return Shape::L;
     }
     if (bends >= 2) {
-        return points.size() <= 4U ? Shape::Z : Shape::Maze;
+        return Shape::Z;
     }
-    return Shape::Maze;
+    return Shape::Z;
 }
 
 static bool evaluate_candidate(
@@ -1053,10 +1292,10 @@ static bool evaluate_candidate(
     const std::vector<ScaledBBox>& node_bboxes,
     const ScaledPoint& source_point,
     const std::unordered_set<PointKey, PointKeyHash>& committed_points,
+    const std::vector<RouteSegment>& committed_segments,
     const std::vector<common::TopoNode>& topo_nodes,
     const NodePorts& parent_ports,
     const NodePorts& child_ports,
-    const ScaledBBox* allowed_bbox,
     int die_width,
     int die_height,
     int scale,
@@ -1084,6 +1323,29 @@ static bool evaluate_candidate(
         if (!in_die(p, die_width, die_height, scale)) {
             ++reject_stats["OUT_OF_BOUNDARY"];
             failure_reason = "OUT_OF_BOUNDARY";
+            return false;
+        }
+    }
+    for (std::size_t i = 1; i + 1 < cand.points.size(); ++i) {
+        const ScaledPoint& p = cand.points[i];
+        if (point_forbidden_for_edge(p, edge, node_points,
+                                     source_point, committed_points)) {
+            if (committed_points.find(to_key(p)) != committed_points.end() &&
+                point_on_allowed_same_cluster_route(p, edge, committed_segments)) {
+                continue;
+            }
+            if (committed_points.find(to_key(p)) != committed_points.end()) {
+                ++reject_stats["CROSSING_COMMITTED_ROUTE"];
+                failure_reason = "CROSSING_COMMITTED_ROUTE";
+                return false;
+            }
+            ++reject_stats["HIT_NODE"];
+            failure_reason = "HIT_NODE";
+            return false;
+        }
+        if (point_inside_forbidden_bbox(p, edge, node_bboxes, topo_nodes)) {
+            ++reject_stats["HIT_BBOX"];
+            failure_reason = "HIT_BBOX";
             return false;
         }
     }
@@ -1116,17 +1378,26 @@ static bool evaluate_candidate(
             }
             if (point_forbidden_for_edge(p, edge, node_points,
                                          source_point, committed_points)) {
+                if (committed_points.find(to_key(p)) != committed_points.end() &&
+                    point_on_allowed_same_cluster_route(p, edge, committed_segments)) {
+                    continue;
+                }
                 if (committed_points.find(to_key(p)) != committed_points.end()) {
-                    ++reject_stats["crossing_committed_route"];
+                    ++reject_stats["CROSSING_COMMITTED_ROUTE"];
                     failure_reason = "CROSSING_COMMITTED_ROUTE";
                     return false;
                 }
                 if (same_point(p, source_point) ||
                     std::find(node_points.begin(), node_points.end(), p) != node_points.end()) {
-                    ++reject_stats["hit_node"];
+                    ++reject_stats["HIT_NODE"];
                     failure_reason = "HIT_NODE";
                     return false;
                 }
+            }
+            if (point_inside_forbidden_bbox(p, edge, node_bboxes, topo_nodes)) {
+                ++reject_stats["HIT_BBOX"];
+                failure_reason = "HIT_BBOX";
+                return false;
             }
         }
         if (i + 1U < cand.points.size()) {
@@ -1140,11 +1411,63 @@ static bool evaluate_candidate(
         }
     }
 
+    const std::vector<RouteSegment> candidate_segments = polyline_segments(cand.points);
+    for (std::size_t i = 0; i < candidate_segments.size(); ++i) {
+        for (std::size_t j = i + 1; j < candidate_segments.size(); ++j) {
+            const bool adjacent = (j == i + 1);
+            ScaledPoint intersection;
+            if (!segment_intersection_point(candidate_segments[i],
+                                            candidate_segments[j],
+                                            intersection)) {
+                continue;
+            }
+            if (segments_overlap_with_length(candidate_segments[i],
+                                             candidate_segments[j])) {
+                ++reject_stats["SELF_INTERSECTION"];
+                failure_reason = "SELF_INTERSECTION";
+                return false;
+            }
+            if (adjacent &&
+                same_point(candidate_segments[i].b, candidate_segments[j].a) &&
+                same_point(intersection, candidate_segments[i].b)) {
+                continue;
+            }
+            ++reject_stats["SELF_INTERSECTION"];
+            failure_reason = "SELF_INTERSECTION";
+            return false;
+        }
+    }
+
+    for (const RouteSegment& cand_segment : candidate_segments) {
+        for (const RouteSegment& committed : committed_segments) {
+            ScaledPoint intersection;
+            if (!segment_intersection_point(cand_segment, committed, intersection)) {
+                continue;
+            }
+            if (segments_overlap_with_length(cand_segment, committed)) {
+                ++reject_stats["OVERLAP_COMMITTED_ROUTE"];
+                failure_reason = "OVERLAP_COMMITTED_ROUTE";
+                return false;
+            }
+            if (allow_same_cluster_global_touch(edge, committed)) {
+                continue;
+            }
+            const bool candidate_endpoint =
+                same_point(intersection, edge.start) || same_point(intersection, edge.goal);
+            if (candidate_endpoint && segment_endpoint(intersection, committed)) {
+                continue;
+            }
+            ++reject_stats["CROSSING_COMMITTED_ROUTE"];
+            failure_reason = "CROSSING_COMMITTED_ROUTE";
+            return false;
+        }
+    }
+
     const Dir parent_exit = step_dir(cand.points.front(), cand.points[1U]);
     const Dir child_entry = opposite(step_dir(cand.points[cand.points.size() - 2U],
                                                cand.points.back()));
     if (parent_exit == Dir::None || child_entry == Dir::None) {
-        ++reject_stats["non_manhattan"];
+        ++reject_stats["NON_MANHATTAN"];
         failure_reason = "NON_MANHATTAN";
         return false;
     }
@@ -1153,7 +1476,7 @@ static bool evaluate_candidate(
     cand.parent_port_available = port_free(parent_ports, parent_exit);
     cand.child_port_available = port_free(child_ports, child_entry);
     if (!cand.parent_port_available || !cand.child_port_available) {
-        ++reject_stats["port_occupied"];
+        ++reject_stats["PORT_OCCUPIED"];
         failure_reason = "PORT_OCCUPIED";
         return false;
     }
@@ -1177,7 +1500,7 @@ static bool evaluate_candidate(
     double bbox_penalty = 0.0;
     for (std::size_t i = 1; i + 1 < cand.points.size(); ++i) {
             if (edge.policy != Policy::LocalClusterPatternOnly &&
-                point_inside_other_bbox(cand.points[i], edge, node_bboxes, allowed_bbox)) {
+                point_inside_forbidden_bbox(cand.points[i], edge, node_bboxes, topo_nodes)) {
                 bbox_penalty += preferred_penalty_weight(edge.policy) * 0.5;
             }
     }
@@ -1188,9 +1511,67 @@ static bool evaluate_candidate(
     if (!cand.used_preferred_child) {
         preferred_cost += penalty;
     }
+    double reserved_top_port_cost = 0.0;
+    if (edge.policy == Policy::ExternalAccessPatternThenMaze) {
+        if (!edge.parent_is_source &&
+            edge.parent_kind == common::NodeKind::ClusterTop &&
+            edge.parent >= 0 &&
+            static_cast<std::size_t>(edge.parent) < topo_nodes.size()) {
+            const common::TopoNode& top_node =
+                topo_nodes[static_cast<std::size_t>(edge.parent)];
+            const int global_parent = topo_nodes[static_cast<std::size_t>(edge.parent)].parent;
+            if (global_parent >= 0 &&
+                static_cast<std::size_t>(global_parent) < node_points.size()) {
+                const Dir toward_global =
+                    dominant_dir_between(edge.start,
+                                         node_points[static_cast<std::size_t>(global_parent)]);
+                if (toward_global != Dir::None && cand.parent_exit_dir == toward_global) {
+                    reserved_top_port_cost += 1000.0;
+                }
+            }
+            if (edge.child_kind != common::NodeKind::ClusterBridge) {
+                int bridge_child = -1;
+                if (top_node.left >= 0 &&
+                    static_cast<std::size_t>(top_node.left) < topo_nodes.size() &&
+                    topo_nodes[static_cast<std::size_t>(top_node.left)].kind ==
+                        common::NodeKind::ClusterBridge) {
+                    bridge_child = top_node.left;
+                }
+                if (top_node.right >= 0 &&
+                    static_cast<std::size_t>(top_node.right) < topo_nodes.size() &&
+                    topo_nodes[static_cast<std::size_t>(top_node.right)].kind ==
+                        common::NodeKind::ClusterBridge) {
+                    bridge_child = top_node.right;
+                }
+                if (bridge_child >= 0 &&
+                    static_cast<std::size_t>(bridge_child) < node_points.size()) {
+                    const Dir toward_bridge =
+                        dominant_dir_between(edge.start,
+                                             node_points[static_cast<std::size_t>(bridge_child)]);
+                    if (toward_bridge != Dir::None && cand.parent_exit_dir == toward_bridge) {
+                        reserved_top_port_cost += 1000.0;
+                    }
+                }
+            }
+        }
+        if (edge.child_kind == common::NodeKind::ClusterTop &&
+            edge.child >= 0 &&
+            static_cast<std::size_t>(edge.child) < topo_nodes.size()) {
+            const int global_parent = topo_nodes[static_cast<std::size_t>(edge.child)].parent;
+            if (global_parent >= 0 &&
+                static_cast<std::size_t>(global_parent) < node_points.size()) {
+                const Dir toward_global =
+                    dominant_dir_between(edge.goal,
+                                         node_points[static_cast<std::size_t>(global_parent)]);
+                if (toward_global != Dir::None && cand.child_entry_dir == toward_global) {
+                    reserved_top_port_cost += 1000.0;
+                }
+            }
+        }
+    }
     cand.score = cand.wirelength + bend_weight * cand.bends + preferred_cost +
-                 detour_penalty + bbox_penalty;
-    cand.shape = shape_from_polyline(cand.points);
+                 detour_penalty + bbox_penalty + reserved_top_port_cost;
+    cand.shape = cand.maze_used ? Shape::Maze : shape_from_polyline(cand.points);
     return true;
 }
 
@@ -1301,7 +1682,12 @@ static std::vector<EdgeInfo> build_edges(const common::Problem& problem,
                                                      source_depth_cache);
     }
 
-    for (int child : tree.source_children) {
+    std::vector<int> source_children = tree.source_children;
+    if (source_children.empty() && tree.root >= 0 &&
+        static_cast<std::size_t>(tree.root) < tree.nodes.size()) {
+        source_children.push_back(tree.root);
+    }
+    for (int child : source_children) {
         if (child < 0 || static_cast<std::size_t>(child) >= tree.nodes.size()) {
             error_msg = "Invalid source child node id " + std::to_string(child);
             return edges;
@@ -1322,7 +1708,7 @@ static std::vector<EdgeInfo> build_edges(const common::Problem& problem,
             edge.has_cluster_bbox = true;
         }
         edge.cluster_depth = node_depth_to_cluster_top(tree.nodes, child, edge.cluster_top);
-        edge.source_depth = source_depth_cache[static_cast<std::size_t>(child)];
+        edge.source_depth = 0;
         edge.policy = classify_policy(edge);
         edge.policy_group = policy_group(edge.policy);
         edge.manhattan_distance = manhattan_scaled(edge.start, edge.goal);
@@ -1378,16 +1764,44 @@ static std::vector<EdgeInfo> build_edges(const common::Problem& problem,
             if (a_policy_priority != b_policy_priority) {
                 return a_policy_priority < b_policy_priority;
             }
-            if (a.cluster_depth != b.cluster_depth) {
-                return a.cluster_depth > b.cluster_depth;
+            if (a.policy == Policy::LocalClusterPatternOnly &&
+                b.policy == Policy::LocalClusterPatternOnly) {
+                if (a.cluster_depth != b.cluster_depth) {
+                    return a.cluster_depth > b.cluster_depth;
+                }
+                if (a.manhattan_distance != b.manhattan_distance) {
+                    return a.manhattan_distance < b.manhattan_distance;
+                }
+            } else if (a.policy == Policy::ExternalAccessPatternThenMaze &&
+                       b.policy == Policy::ExternalAccessPatternThenMaze) {
+                const int a_access_priority =
+                    (a.child_kind == common::NodeKind::ClusterAccess ||
+                     a.parent_kind == common::NodeKind::ClusterAccess) ? 0 : 1;
+                const int b_access_priority =
+                    (b.child_kind == common::NodeKind::ClusterAccess ||
+                     b.parent_kind == common::NodeKind::ClusterAccess) ? 0 : 1;
+                if (a_access_priority != b_access_priority) {
+                    return a_access_priority < b_access_priority;
+                }
+                if (a.cluster_depth != b.cluster_depth) {
+                    return a.cluster_depth > b.cluster_depth;
+                }
+                if (a.manhattan_distance != b.manhattan_distance) {
+                    return a.manhattan_distance < b.manhattan_distance;
+                }
             }
         } else {
             if (a.source_depth != b.source_depth) {
                 return a.source_depth > b.source_depth;
             }
-        }
-        if (a.manhattan_distance != b.manhattan_distance) {
-            return a.manhattan_distance > b.manhattan_distance;
+            const bool a_source_adjacent = a.parent_is_source;
+            const bool b_source_adjacent = b.parent_is_source;
+            if (a_source_adjacent != b_source_adjacent) {
+                return !a_source_adjacent;
+            }
+            if (a.manhattan_distance != b.manhattan_distance) {
+                return a.manhattan_distance < b.manhattan_distance;
+            }
         }
         if (a.parent != b.parent) {
             return a.parent < b.parent;
@@ -1630,6 +2044,7 @@ RouterResult run(const common::Problem& problem,
     std::vector<NodePorts> node_ports(tree.nodes.size());
     NodePorts source_ports;
     std::unordered_set<PointKey, PointKeyHash> committed_points;
+    std::vector<RouteSegment> committed_segments;
 
     result.edge_debugs.resize(edges.size());
     bool failure = false;
@@ -1653,9 +2068,10 @@ RouterResult run(const common::Problem& problem,
         }
 
         const bool local_stage = edge.policy == Policy::LocalClusterPatternOnly;
-        const ScaledBBox* allowed_bbox =
-            (local_stage && edge.has_cluster_bbox) ? &node_bboxes[static_cast<std::size_t>(edge.cluster_top)]
-                                                   : nullptr;
+        const ScaledBBox* related_bbox =
+            (edge.has_cluster_bbox && edge.cluster_top >= 0)
+                ? &node_bboxes[static_cast<std::size_t>(edge.cluster_top)]
+                : nullptr;
         const std::vector<Dir> parent_dirs =
             edge.parent_is_source ? available_dirs(source_ports)
                                   : available_dirs(node_ports[static_cast<std::size_t>(edge.parent)]);
@@ -1681,10 +2097,10 @@ RouterResult run(const common::Problem& problem,
             std::string reason;
             const bool legal = evaluate_candidate(edge, cand, node_points, node_bboxes,
                                                   source_point, committed_points,
+                                                  committed_segments,
                                                   tree.nodes,
                                                   edge.parent_is_source ? source_ports : node_ports[static_cast<std::size_t>(edge.parent)],
                                                   node_ports[static_cast<std::size_t>(edge.child)],
-                                                  allowed_bbox,
                                                   problem.die_width, problem.die_height, scale,
                                                   reject_stats, reason);
             if (!legal) {
@@ -1702,10 +2118,27 @@ RouterResult run(const common::Problem& problem,
             maze_attempted = true;
             std::string maze_fail_reason;
             const int bend_weight = static_cast<int>(std::lround(bend_penalty_weight(edge.policy)));
+            ScaledBBox local_search_bbox;
+            const ScaledBBox* search_bbox = nullptr;
+            bool restrict_to_search_bbox = false;
+            if (local_stage && related_bbox != nullptr) {
+                local_search_bbox = *related_bbox;
+                const long long margin =
+                    std::max<long long>(4 * scale, std::min<long long>(20 * scale, edge.manhattan_distance / 2 + scale));
+                local_search_bbox = expand_bbox_to_point(local_search_bbox, edge.start, margin);
+                local_search_bbox = expand_bbox_to_point(local_search_bbox, edge.goal, margin);
+                local_search_bbox = clamp_bbox_to_die(local_search_bbox,
+                                                      problem.die_width,
+                                                      problem.die_height,
+                                                      scale);
+                search_bbox = &local_search_bbox;
+                restrict_to_search_bbox = true;
+            }
             Candidate maze_candidate = run_maze_search(edge, node_points, node_bboxes,
                                                        source_point, committed_points,
-                                                       problem, scale, allowed_bbox,
-                                                       local_stage, bend_weight,
+                                                       committed_segments, tree.nodes,
+                                                       problem, scale, search_bbox,
+                                                       restrict_to_search_bbox, bend_weight,
                                                        maze_fail_reason);
             ++maze_candidate_count;
             debug.maze_used = true;
@@ -1715,10 +2148,10 @@ RouterResult run(const common::Problem& problem,
                 std::string reason;
                 const bool legal = evaluate_candidate(edge, cand, node_points, node_bboxes,
                                                       source_point, committed_points,
+                                                      committed_segments,
                                                       tree.nodes,
                                                       edge.parent_is_source ? source_ports : node_ports[static_cast<std::size_t>(edge.parent)],
                                                       node_ports[static_cast<std::size_t>(edge.child)],
-                                                      allowed_bbox,
                                                       problem.die_width, problem.die_height, scale,
                                                       reject_stats, reason);
                 if (legal) {
@@ -1761,7 +2194,7 @@ RouterResult run(const common::Problem& problem,
             continue;
         }
 
-        add_route_to_blocked(best.points, committed_points);
+        add_route_to_blocked(best.points, edge, committed_points, committed_segments);
         if (edge.parent_is_source) {
             occupy_port(source_ports, best.parent_exit_dir);
         } else {

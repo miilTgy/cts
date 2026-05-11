@@ -31,6 +31,8 @@
 
 source 可以作为虚拟 endpoint 使用 problem source loc，不要求它一定存在于 topology nodes 中。
 
+如果 topology 的 `source_children` 为空，但 `tree.root` 有效，则 router 必须补一条虚拟 `Source -> tree.root` edge。很多 topology 只把 root 作为全局根，不显式填 `source_children`；router 不能因此漏掉 source 到 global/root 的连接。
+
 ---
 
 ## 1.5 Debug API
@@ -90,6 +92,7 @@ if (g_debug_file_enabled) {
 - ClusterInternal <-> ClusterInternal
 - ClusterInternal <-> ClusterAccess
 - ClusterAccess <-> ClusterAccess，如果存在
+- ClusterTop <-> Sink，如果该 cluster 是 outlier/small cluster，top 直接连 sink，没有 access/bridge
 
 策略：
 - 只使用 pattern route：I-shape、L-shape、Z-shape。
@@ -111,6 +114,10 @@ if (g_debug_file_enabled) {
 - A* 应倾向形成近似“匚”字形路线：先从 access 离开 cluster bbox，再沿 bbox 外侧走，最后接入 bridge/top。
 - A* cost 至少包含：path_length、bend_penalty、crossing_penalty、near_sink_penalty、inside_cluster_penalty、wrong_side_penalty、over_detour_penalty。
 - crossing、压 sink、压 node 应该是 forbidden 或极大 penalty。
+- External route 需要避免抢占 ClusterTop 留给 bridge/global 的关键 port：
+  - 对 `ClusterTop -> ClusterAccess`，如果 top 还有 `ClusterBridge` child，candidate 使用“top 朝 bridge 的方向”应加很大 penalty。
+  - 对所有从 ClusterTop 出发的 external edge，candidate 使用“top 朝 global parent/source 主干的方向”应加很大 penalty。
+  - `ClusterTop -> ClusterBridge` 本身可以使用 top 朝 bridge 的方向；这个方向通常应留给 bridge-to-top edge。
 
 注意：ExternalAccessPatternThenMaze 虽然是 access/bridge/top 的接入线 policy，但在 route order 上属于对应 cluster 的 Stage A；不是等所有 cluster 完成后才统一 route。
 
@@ -128,6 +135,11 @@ if (g_debug_file_enabled) {
 - 尽量保持 global chain 的主轴顺序。
 - 不要穿过 cluster bbox 内部，除非目标就是该 cluster top。
 - Z-shape 中间轨道优先选择 global chain 主轴附近或 source 轴附近。
+- Global -> ClusterTop 接入时，可以在非常受限的情况下碰到该 cluster 自己已经 committed 的 Stage A route：
+  - 只允许目标是该 ClusterTop，且被碰到的 committed segment 属于同一个 cluster。
+  - 只用于解决 top 周围被本 cluster access/bridge 线封口的问题。
+  - 不允许 overlap 共线复用；不允许碰到其它 cluster 的 route；不允许 global/global 或 source/global 主干之间互相触碰。
+  - 这不是一般 T-junction 许可，只是同 cluster top 接入的局部例外。
 
 ---
 
@@ -239,6 +251,8 @@ VH: (x1, y1) -> (x1, y2) -> (x2, y2)
 - cluster bbox 外侧 track。
 - access preferred side 外侧 track。
 - endpoint 附近若干 safe track。
+- node loc 与 bbox 边界附近多级 safe track，例如 `±0.5 grid`、`±1 grid`、`±1.5 grid`、`±2 grid` 等。不要只枚举 `±0.5`；top/access 周围被短 stub 封住时，需要稍远一层 track 才能绕开。
+- 对 GlobalPatternThenMaze，还要额外枚举 source/global/root 轴附近的 safe track，避免全局主干只能走在 cluster 内部或刚好压住局部接入线。
 
 pattern route 不应只枚举几何形状，还要枚举 endpoint ports：
 
@@ -262,7 +276,20 @@ for each available parent_exit_dir:
 
 ## 6. Incremental Legality Check
 
-router 必须是 incremental routing。每 route 一条 edge，都要基于当前已经 commit 的 routes 检查合法性。只有合法 candidate 才能 commit；commit 后，该 route 的 segments 成为后续 route 的障碍。
+router 必须是 incremental routing。每 route 一条 edge，都要基于当前已经 commit 的 routes 检查合法性。只有合法 candidate 才能 commit；commit 后，该 route 的完整 segments 成为后续 route 的障碍。
+
+实现上不要只把 committed route 的离散 grid 点加入障碍；必须保存完整 segment 列表，例如：
+
+```cpp
+struct CommittedSegment {
+    Point a;
+    Point b;
+    Policy policy;
+    int cluster_top;
+};
+```
+
+`policy` 和 `cluster_top` 用于判断同 cluster top 接入例外；所有 crossing/overlap 判断必须基于 segment 几何，而不是只靠点集。
 
 每条 candidate route 至少检查以下规则。
 
@@ -281,6 +308,8 @@ node 先按点障碍处理：
 - source loc 是障碍点。
 
 如果 node 有 bbox，则 bbox 内部也视为障碍区域。route 不能穿过其他 node 的 bbox。
+
+实际检查 bbox 时，应重点把其它 `ClusterTop` 的 bbox 当作 forbidden bbox。当前 edge 所属的 cluster bbox 不能误判为 forbidden；否则 cluster 内部 sink/internal/access 的短线会全部失败。非 ClusterTop 节点的 bbox 常常只是其 subtree/cluster region，不能机械地全部当作独立 forbidden box。
 
 例外：
 - route 可以从当前 edge 的起点 node 出发。
@@ -318,6 +347,12 @@ candidate 的每个 segment 都要和所有已 commit route segments 做 interse
 - 只共享 endpoint 可以允许。
 - 有长度重叠默认 illegal overlap，除非作业明确允许共线复用。
 - 为安全起见，默认 forbidden overlap。
+
+Committed route 的 crossing/overlap 判断必须扫描完整 committed segment list：
+- 水平/垂直交点在两段内部时是 `CROSSING_COMMITTED_ROUTE`。
+- 共线有正长度重叠时是 `OVERLAP_COMMITTED_ROUTE`。
+- 只在双方 endpoint 相遇才可以允许。
+- `Global -> 当前 ClusterTop` 碰到同 cluster 的 Stage A route 可按 2.3 的受限例外处理，但仍不能 overlap。
 
 ### 6.4 不自交
 
@@ -362,6 +397,12 @@ score = wirelength
 非法情况，例如压 node、压 sink、越界、非法交叉、port 被占用，应该直接判 illegal，不参与 scoring。
 
 A* maze routing 只在 policy 允许时调用。A* 的 neighbor 是四方向 grid movement，需要记录前一个方向以计算 bend penalty。
+
+对于 LocalClusterPatternOnly 的 maze fallback，必须使用 bounded local search window。窗口可以由当前 cluster bbox 与当前 edge endpoints 共同扩张得到，并 clamp 到 die boundary；不能让 local edge 全局乱绕。
+
+Pattern candidate 与 maze candidate 都必须走同一个 `check_legality()`，maze 找到 path 后不能直接 commit。
+
+为了调试一致性，pattern 生成出的多 bend Z/safe-track route 仍应标记为 `Z`，不要仅因为 canonicalized polyline 有 4 个以上点就标成 `MAZE`；只有 A* fallback 产生的 route 才标记 `MAZE`。
 
 ---
 
@@ -418,6 +459,8 @@ within each cluster:
     access-side edge first
     bridge-to-top later
     shorter Manhattan distance first
+    avoid consuming ClusterTop's global-facing port before Stage B
+    avoid consuming ClusterTop's bridge-facing port before bridge-to-top edge
   then lower edge_id for deterministic order
 ```
 
@@ -449,6 +492,8 @@ GlobalPatternThenMaze edges 的顺序必须从 cluster/top 侧向 source 汇合�
 应先 route farther_from_source 的 global/top 边，source-adjacent edge 最后 route。
 
 `Source <-> ClusterTop` 仅在 topology 中 source 直接连接 ClusterTop 时适用；一般情况是 `ClusterTop -> Global -> ... -> Source`。
+
+如果 `tree.source_children` 为空，Stage B 必须把 `Source -> tree.root` 当作最后一条 source-adjacent edge。不要因为 source 不在 topology nodes 中就跳过 source/root route。
 
 推荐 global edge sort key：
 
