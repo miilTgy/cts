@@ -8,8 +8,8 @@ EVAL_TARGET = evaluate
 SAMPLE ?= samples/sample1.txt
 SAMPLE_BASE = $(basename $(notdir $(SAMPLE)))
 SOLUTION = result/$(SAMPLE_BASE)_solution.txt
-SRC = $(SRC_DIR)/main.cc $(SRC_DIR)/parser.cc $(SRC_DIR)/partitioner.cc $(SRC_DIR)/partreer.cc $(SRC_DIR)/treer.cc $(SRC_DIR)/bu.cc $(SRC_DIR)/td.cc $(SRC_DIR)/writer.cc
-INC = $(INC_DIR)/common.h $(INC_DIR)/parser.h $(INC_DIR)/partitioner.h $(INC_DIR)/partreer.h $(INC_DIR)/treer.h $(INC_DIR)/bu.h $(INC_DIR)/td.h $(INC_DIR)/writer.h
+SRC = $(SRC_DIR)/main.cc $(SRC_DIR)/parser.cc $(SRC_DIR)/partitioner.cc $(SRC_DIR)/partreer.cc $(SRC_DIR)/treer.cc $(SRC_DIR)/bu.cc $(SRC_DIR)/td.cc $(SRC_DIR)/locer.cc $(SRC_DIR)/router.cc $(SRC_DIR)/writer.cc
+INC = $(INC_DIR)/common.h $(INC_DIR)/parser.h $(INC_DIR)/partitioner.h $(INC_DIR)/partreer.h $(INC_DIR)/treer.h $(INC_DIR)/bu.h $(INC_DIR)/td.h $(INC_DIR)/locer.h $(INC_DIR)/router.h $(INC_DIR)/writer.h
 CXXFLAGS = $(CXX_STD) $(WARN_FLAGS) -I$(INC_DIR)
 
 .PHONY: all run eval clean

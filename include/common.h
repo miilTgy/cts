@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,8 @@ enum class NodeKind {
     Sink,
     ClusterInternal,
     ClusterAccess,
+    ClusterBridge,
+    ClusterTop,
     Global
 };
 
@@ -86,6 +89,7 @@ struct TopoTree {
     std::vector<TopoNode> nodes;
     int root = -1;
     int cluster_root = -1;
+    std::vector<int> source_children;
     bool valid = false;
     std::string error_msg;
 };
@@ -126,8 +130,36 @@ struct BufferChoice {
     int buffer_type_index = -1;
 };
 
+enum class DmeNodeClass {
+    Sink,
+    Internal,
+    Access
+};
+
+struct ClusterDmeNode {
+    int local_id = -1;
+    int origin_node_id = -1;
+    DmeNodeClass node_class = DmeNodeClass::Internal;
+    int left = -1;
+    int right = -1;
+    int parent = -1;
+    int sink_index = -1;
+    int sink_count = 0;
+};
+
+struct ClusterDmeInput {
+    int cluster_id = -1;
+    int root_local_id = -1;
+    int root_origin_node_id = -1;
+    std::vector<ClusterDmeNode> nodes;
+    bool valid = false;
+    std::string error_msg;
+};
+
 struct BottomUpNodeResult {
     int node_id = -1;
+    int local_id = -1;
+    int origin_node_id = -1;
     bool valid = false;
 
     MergingSegment ms;
@@ -151,18 +183,32 @@ struct BottomUpNodeResult {
 };
 
 struct BottomUpResult {
+    int cluster_id = -1;
     std::vector<BottomUpNodeResult> node_results;
+    std::vector<int> local_to_origin_node_id;
+    int root_local_id = -1;
+    int root_origin_node_id = -1;
     int root = -1;
     bool valid = false;
     std::string error_msg;
 };
 
+struct TopDownConfig {
+    bool has_root_loc = false;
+    SegmentPoint root_loc;
+    std::string root_loc_mode;
+};
+
 struct TopDownNodeResult {
     int node_id = -1;
+    int local_id = -1;
+    int origin_node_id = -1;
     bool valid = false;
 
     SegmentPoint loc;
     int parent_id = -1;
+    int parent_local_id = -1;
+    int parent_origin_node_id = -1;
 
     double assigned_edge_to_parent = 0.0;
     double geometric_distance_to_parent = 0.0;
@@ -175,6 +221,10 @@ struct TopDownNodeResult {
     std::vector<SegmentPoint> final_route_to_parent;
 
     MergingSegment feasible_ms;
+    bool used_feasible_intersection = false;
+    std::string loc_mode;
+    int candidate_count = 0;
+    double loc_score = 0.0;
 
     bool has_buffer = false;
     int buffer_type_index = -1;
@@ -187,10 +237,86 @@ struct TopDownNodeResult {
 };
 
 struct TopDownResult {
+    int cluster_id = -1;
     std::vector<TopDownNodeResult> node_results;
+    std::vector<int> local_to_origin_node_id;
+    int root_local_id = -1;
+    int root_origin_node_id = -1;
     int root = -1;
     bool valid = false;
     std::string error_msg;
+};
+
+struct LocerNodeResult {
+    int node_id = -1;
+    bool valid = false;
+
+    SegmentPoint loc;
+    std::string node_class;
+    int cluster_id = -1;
+
+    std::string loc_mode;
+    double loc_score = 0.0;
+    int candidate_count = 0;
+
+    bool inside_related_bbox = false;
+    double congestion_penalty = 0.0;
+    double lshape_penalty = 0.0;
+    double wire_est_to_parent = 0.0;
+
+    std::vector<double> sink_delays_to_node;
+    double min_sink_delay_to_node = 0.0;
+    double max_sink_delay_to_node = 0.0;
+    double skew_to_node = 0.0;
+    double skew_penalty = 0.0;
+};
+
+struct LocerResult {
+    std::vector<LocerNodeResult> node_results;
+    bool valid = false;
+    std::string error_msg;
+};
+
+struct RouterEdgeDebug {
+    int edge_id = -1;
+    int parent = -1;
+    int child = -1;
+    std::string parent_class;
+    std::string child_class;
+    std::string policy;
+    std::string selected_shape;
+    std::string parent_exit_dir;
+    std::string child_entry_dir;
+
+    bool parent_port_available = false;
+    bool child_port_available = false;
+    bool used_preferred_parent = false;
+    bool used_preferred_child = false;
+
+    int pattern_candidate_count = 0;
+    int maze_candidate_count = 0;
+    int legal_candidate_count = 0;
+    bool maze_used = false;
+    int maze_expanded_nodes = 0;
+    double maze_best_cost = 0.0;
+    std::string maze_failed_reason;
+
+    double selected_score = 0.0;
+    double wirelength = 0.0;
+    int bends = 0;
+
+    bool routed = false;
+    std::string failure_reason;
+    std::vector<SegmentPoint> polyline;
+
+    std::map<std::string, int> reject_stats;
+};
+
+struct RouterResult {
+    bool valid = false;
+    std::string error_msg;
+    std::string output_path;
+    std::vector<RouterEdgeDebug> edge_debugs;
 };
 
 }  // namespace common

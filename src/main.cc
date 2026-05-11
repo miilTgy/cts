@@ -1,10 +1,13 @@
 #include <iostream>
+#include <filesystem>
 
 #include "common.h"
 #include "parser.h"
 #include "treer.h"
 #include "bu.h"
 #include "td.h"
+#include "locer.h"
+#include "router.h"
 #include "writer.h"
 #include "partitioner.h"
 
@@ -19,6 +22,10 @@ int main(int argc, char** argv) {
     treer::debug_enable(true);
     bu::debug_enable(true);
     td::debug_enable(true);
+    locer::debug_enable(true);
+    locer::debug_file_enable(true);
+    router::debug_enable(true);
+    router::debug_file_enable(true);
     writer::debug_enable(true);
 
     common::Problem problem = parser::parse(argv[1]);
@@ -37,29 +44,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Temporarily stop after topology generation. Re-enable the following
-    // stages when BU/TD/Writer are ready to be run in the full CTS flow.
-    
-    // common::BottomUpResult bu_result = bu::run(problem, tree);
-    // if (!bu_result.valid) {
-    //     std::cerr << "BU error: " << bu_result.error_msg << "\n";
-    //     return 1;
-    // }
-    
-    // common::TopDownResult td_result = td::run(problem, tree, bu_result);
-    // if (!td_result.valid) {
-    //     std::cerr << "TD error: " << td_result.error_msg << "\n";
-    //     return 1;
-    // }
-    
-    // writer::WriterResult writer_result =
-    //     writer::write_solution(argv[1], problem, tree, bu_result, td_result);
-    // if (!writer_result.valid) {
-    //     std::cerr << "Writer error: " << writer_result.error_msg << "\n";
-    //     return 1;
-    // }
-    
-    // std::cout << "Wrote solution: " << writer_result.output_path << "\n";
+    common::LocerResult loc_result = locer::run(problem, tree, argv[1]);
+    if (!loc_result.valid) {
+        std::cerr << "LOCER error: " << loc_result.error_msg << "\n";
+        return 1;
+    }
+    std::filesystem::path input_path(argv[1]);
+    std::cout << "Locer: wrote loc/" << input_path.stem().string()
+              << "_loc.txt\n";
+
+    common::RouterResult route_result = router::run(problem, tree, loc_result, argv[1]);
+    if (!route_result.valid) {
+        std::cerr << "ROUTER error: " << route_result.error_msg << "\n";
+        return 1;
+    }
+    if (!route_result.output_path.empty()) {
+        std::cout << "Router: wrote " << route_result.output_path << "\n";
+    }
 
     return 0;
 }
