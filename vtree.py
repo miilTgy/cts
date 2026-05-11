@@ -32,6 +32,7 @@ class Node:
 
 LeafInfo = Tuple[int, str, int, int]
 GeoPos = Optional[Tuple[float, float]]
+Edge = Tuple[Optional[int], int]
 
 KIND_STYLES = {
     "SINK": {
@@ -54,6 +55,20 @@ KIND_STYLES = {
         "text": "#102a43",
         "grid_marker": "s",
         "label": "Cluster access",
+    },
+    "CLUSTER_BRIDGE": {
+        "face": "#d6bcfa",
+        "edge": "#6b46c1",
+        "text": "#201047",
+        "grid_marker": "P",
+        "label": "Cluster bridge",
+    },
+    "CLUSTER_TOP": {
+        "face": "#fbd38d",
+        "edge": "#c05621",
+        "text": "#3b1f0b",
+        "grid_marker": "*",
+        "label": "Cluster top",
     },
     "GLOBAL": {
         "face": "#c6f6d5",
@@ -109,7 +124,8 @@ def parse_float(token: str, context: str) -> float:
 def parse_tree_file(path: str):
     nodes: Dict[int, Node] = {}
     leaf_info: Dict[int, LeafInfo] = {}
-    edges: List[Tuple[int, int]] = []
+    edges: List[Edge] = []
+    source_children: List[int] = []
     root = -1
     num_nodes = None
     num_sinks = None
@@ -136,6 +152,9 @@ def parse_tree_file(path: str):
                 if len(parts) != 2:
                     fail(f"{path}:{line_no}: NUM_NODES expects 1 value")
                 num_nodes = parse_int(parts[1], "NUM_NODES")
+            elif kind == "SOURCE":
+                if len(parts) != 3:
+                    fail(f"{path}:{line_no}: SOURCE expects x and y")
             elif kind == "NUM_SINKS":
                 if len(parts) != 2:
                     fail(f"{path}:{line_no}: NUM_SINKS expects 1 value")
@@ -188,15 +207,19 @@ def parse_tree_file(path: str):
             elif kind == "EDGE":
                 if len(parts) != 3:
                     fail(f"{path}:{line_no}: EDGE expects parent_id and child_id")
-                parent_id = parse_int(parts[1], "EDGE parent_id")
+                parent_id = None if parts[1] == "SRC" else parse_int(parts[1], "EDGE parent_id")
                 child_id = parse_int(parts[2], "EDGE child_id")
+                if parent_id is None:
+                    source_children.append(child_id)
                 edges.append((parent_id, child_id))
 
     if not tree_valid_seen:
         fail(f"{path}: missing TREE_VALID line")
-    if root < 0:
+    if root < 0 and nodes and not source_children:
         fail(f"{path}: missing ROOT line")
-    if root not in nodes:
+    if root < 0 and not nodes:
+        return root, nodes, leaf_info, edges, source_children
+    if root >= 0 and root not in nodes:
         fail(f"{path}: ROOT node {root} is not present in NODE records")
 
     if num_nodes is not None and num_nodes != len(nodes):
@@ -205,12 +228,12 @@ def parse_tree_file(path: str):
         warn(f"{path}: NUM_SINKS is {num_sinks}, but parsed {len(leaf_info)} LEAF lines")
 
     for parent_id, child_id in edges:
-        if parent_id not in nodes:
+        if parent_id is not None and parent_id not in nodes:
             warn(f"{path}: EDGE references missing parent node {parent_id}")
         if child_id not in nodes:
             warn(f"{path}: EDGE references missing child node {child_id}")
 
-    return root, nodes, leaf_info, edges
+    return root, nodes, leaf_info, edges, source_children
 
 
 def parse_sample_file(path: str) -> Tuple[int, int, float, float]:
@@ -272,12 +295,18 @@ def manhattan(x1: float, y1: float, x2: float, y2: float) -> float:
     return abs(x1 - x2) + abs(y1 - y2)
 
 
+def clamp_float(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(value, hi))
+
+
 def compute_max_est_skew(
     root: int,
     nodes: Dict[int, Node],
     leaf_info: Dict[int, LeafInfo],
     source_pos: Tuple[float, float],
+    source_children: List[int],
 ) -> float:
+    source_child_set = set(source_children)
     leaf_delays = []
     for leaf_id in leaf_info:
         if leaf_id not in nodes:
@@ -286,13 +315,35 @@ def compute_max_est_skew(
 
         total = 0.0
         current = leaf_id
-        while current != root:
+        while True:
+            if current == root and root >= 0:
+                root_node = nodes.get(root)
+                if root_node is None:
+                    warn(f"skew skipped root-to-source segment because root node {root} is missing")
+                    break
+                total += manhattan(root_node.cx, root_node.cy, source_pos[0], source_pos[1])
+                leaf_delays.append(total)
+                break
+
             node = nodes.get(current)
             if node is None:
                 warn(f"skew path from leaf {leaf_id} stopped at missing node {current}")
                 break
 
             parent_id = node.parent
+            if parent_id < 0:
+                if root < 0 and current in source_child_set:
+                    current_pos = get_node_debug_pos(current, nodes, leaf_info)
+                    if current_pos is None:
+                        warn(f"skew path from leaf {leaf_id} stopped at missing source child geometry")
+                        break
+                    cx, cy = current_pos
+                    total += manhattan(cx, cy, source_pos[0], source_pos[1])
+                    leaf_delays.append(total)
+                else:
+                    warn(f"skew path from leaf {leaf_id} stopped before reaching root/source")
+                break
+
             parent = nodes.get(parent_id)
             if parent is None:
                 warn(f"skew path from leaf {leaf_id} stopped at missing parent {parent_id}")
@@ -308,13 +359,6 @@ def compute_max_est_skew(
             px, py = parent_pos
             total += manhattan(cx, cy, px, py)
             current = parent_id
-        else:
-            root_node = nodes.get(root)
-            if root_node is None:
-                warn(f"skew skipped root-to-source segment because root node {root} is missing")
-            else:
-                total += manhattan(root_node.cx, root_node.cy, source_pos[0], source_pos[1])
-            leaf_delays.append(total)
 
     if not leaf_delays:
         return 0.0
@@ -322,7 +366,7 @@ def compute_max_est_skew(
     return max(leaf_delays) - min(leaf_delays)
 
 
-def compute_tree_depth(root: int, nodes: Dict[int, Node]) -> int:
+def compute_tree_depth(root: int, nodes: Dict[int, Node], source_children: List[int]) -> int:
     def dfs(node_id: int) -> int:
         node = nodes.get(node_id)
         if node is None:
@@ -341,11 +385,20 @@ def compute_tree_depth(root: int, nodes: Dict[int, Node]) -> int:
 
         return 1 + max(child_depths)
 
-    return dfs(root)
+    if root >= 0:
+        return dfs(root)
+    if source_children:
+        return 1 + max(dfs(child_id) for child_id in source_children)
+    return 0
 
 
-def compute_topology_layout(root: int, nodes: Dict[int, Node]) -> Dict[int, Tuple[float, float]]:
+def compute_topology_layout(
+    root: int,
+    nodes: Dict[int, Node],
+    source_children: List[int],
+) -> Dict[int, Tuple[float, float]]:
     pos: Dict[int, Tuple[float, float]] = {}
+
     next_leaf_x = [0.0]
 
     def dfs(node_id: int, depth: int) -> float:
@@ -371,7 +424,11 @@ def compute_topology_layout(root: int, nodes: Dict[int, Node]) -> Dict[int, Tupl
         pos[node_id] = (x, -float(depth))
         return x
 
-    dfs(root, 0)
+    if root >= 0:
+        dfs(root, 0)
+    else:
+        for child_id in source_children:
+            dfs(child_id, 1)
     return pos
 
 
@@ -380,14 +437,43 @@ def draw_topology(
     root: int,
     nodes: Dict[int, Node],
     leaf_info: Dict[int, LeafInfo],
-    edges: List[Tuple[int, int]],
+    edges: List[Edge],
+    source_pos: Tuple[float, float],
+    source_children: List[int],
 ) -> None:
-    pos = compute_topology_layout(root, nodes)
+    pos = compute_topology_layout(root, nodes, source_children)
     num_leaves = max(1, len(leaf_info))
     marker_size = max(18, min(90, 2200 / num_leaves))
     font_size = max(4, min(8, int(150 / max(num_leaves, 1))))
+    source_marker_size = max(marker_size * 1.25, 90)
+
+    source_layout_pos: Optional[Tuple[float, float]] = None
+    if root >= 0 and root in pos:
+        root_x, root_y = pos[root]
+        source_layout_pos = (root_x, root_y + 1.0)
+        ax.plot(
+            [source_layout_pos[0], root_x],
+            [source_layout_pos[1], root_y],
+            color="black",
+            linewidth=1.4,
+            zorder=1,
+        )
+    elif source_children:
+        child_positions = [pos[child] for child in source_children if child in pos]
+        if child_positions:
+            sx = sum(p[0] for p in child_positions) / len(child_positions)
+            sy = max(p[1] for p in child_positions) + 1.0
+            source_layout_pos = (sx, sy)
+            for child_id in source_children:
+                if child_id not in pos:
+                    warn(f"topology source edge SRC->{child_id} skipped because position is missing")
+                    continue
+                cx, cy = pos[child_id]
+                ax.plot([sx, cx], [sy, cy], color="black", linewidth=1.4, zorder=1)
 
     for parent_id, child_id in edges:
+        if parent_id is None:
+            continue
         if parent_id not in pos or child_id not in pos:
             warn(f"topology edge {parent_id}->{child_id} skipped because position is missing")
             continue
@@ -399,15 +485,14 @@ def draw_topology(
         node = nodes[node_id]
         is_root = node_id == root
         style = kind_style(node)
-        facecolor = "gold" if is_root else style["face"]
-        edgecolor = "darkorange" if is_root else style["edge"]
         ax.scatter(
             [x],
             [y],
             s=marker_size,
-            facecolors=facecolor,
-            edgecolors=edgecolor,
-            linewidths=1.0,
+            marker=style["grid_marker"],
+            facecolors=style["face"],
+            edgecolors=style["edge"],
+            linewidths=2.0 if is_root else 1.0,
             zorder=3,
         )
         if node.is_leaf:
@@ -424,11 +509,46 @@ def draw_topology(
                     fontsize=font_size * 0.85, fontweight="bold",
                     color="darkorange", zorder=5)
 
+    if source_layout_pos is not None:
+        sx, sy = source_layout_pos
+        ax.scatter(
+            [sx],
+            [sy],
+            s=source_marker_size,
+            marker="^",
+            facecolors="red",
+            edgecolors="darkred",
+            linewidths=1.5,
+            zorder=6,
+        )
+        ax.text(sx, sy + 0.22, "SRC", ha="center", va="bottom",
+                fontsize=max(font_size, 7), color="darkred", zorder=7)
+
     if pos:
         xs = [p[0] for p in pos.values()]
         ys = [p[1] for p in pos.values()]
+        if source_layout_pos is not None:
+            xs.append(source_layout_pos[0])
+            ys.append(source_layout_pos[1])
         ax.set_xlim(min(xs) - 1.0, max(xs) + 1.0)
         ax.set_ylim(min(ys) - 1.0, max(ys) + 1.0)
+
+    if root < 0 and not source_children:
+        ax.text(0.5, 0.5, "EMPTY TREE", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12, fontweight="bold")
+        ax.scatter(
+            [0.5],
+            [0.78],
+            s=source_marker_size,
+            marker="^",
+            facecolors="red",
+            edgecolors="darkred",
+            linewidths=1.5,
+            transform=ax.transAxes,
+            zorder=6,
+        )
+        ax.text(0.5, 0.86, "SRC", ha="center", va="bottom",
+                fontsize=10, color="darkred", transform=ax.transAxes, zorder=7)
 
     ax.set_title("Binary Topology")
     add_kind_legend(ax)
@@ -439,7 +559,14 @@ def draw_topology(
 def add_kind_legend(ax) -> None:
     handles = []
     labels = []
-    for kind in ("SINK", "CLUSTER_INTERNAL", "CLUSTER_ACCESS", "GLOBAL"):
+    for kind in (
+        "SINK",
+        "CLUSTER_INTERNAL",
+        "CLUSTER_ACCESS",
+        "CLUSTER_BRIDGE",
+        "CLUSTER_TOP",
+        "GLOBAL",
+    ):
         style = KIND_STYLES[kind]
         handle = ax.scatter(
             [],
@@ -459,9 +586,41 @@ def compute_grid_visual_pos(
     root: int,
     nodes: Dict[int, Node],
     leaf_info: Dict[int, LeafInfo],
+    source_pos: Tuple[float, float],
+    width: int,
+    height: int,
+    source_children: List[int],
 ) -> Dict[int, Tuple[float, float]]:
     visual_pos: Dict[int, Tuple[float, float]] = {}
+    if root < 0 and not source_children:
+        return visual_pos
+
     visiting = set()
+    outside_margin = max(2.0, 0.03 * float(min(width, height)))
+
+    def cluster_top_external_anchor(node: Node) -> Tuple[float, float]:
+        if node.parent >= 0 and node.parent in nodes:
+            parent = nodes[node.parent]
+            return parent.cx, parent.cy
+        return source_pos
+
+    def cluster_top_visual_pos(node: Node) -> Tuple[float, float]:
+        ax, ay = cluster_top_external_anchor(node)
+        center_x = (float(node.bbox_lx) + float(node.bbox_ux)) / 2.0
+        center_y = (float(node.bbox_ly) + float(node.bbox_uy)) / 2.0
+        dx = ax - center_x
+        dy = ay - center_y
+
+        if abs(dx) >= abs(dy):
+            y = clamp_float(ay, float(node.bbox_ly), float(node.bbox_uy))
+            if dx < 0:
+                return float(node.bbox_lx) - outside_margin, y
+            return float(node.bbox_ux) + outside_margin, y
+
+        x = clamp_float(ax, float(node.bbox_lx), float(node.bbox_ux))
+        if dy < 0:
+            return x, float(node.bbox_ly) - outside_margin
+        return x, float(node.bbox_uy) + outside_margin
 
     def dfs(node_id: int) -> GeoPos:
         if node_id in visual_pos:
@@ -497,12 +656,19 @@ def compute_grid_visual_pos(
 
             ux = sum(pos[0] for pos in child_positions if pos is not None) / len(child_positions)
             uy = sum(pos[1] for pos in child_positions if pos is not None) / len(child_positions)
-            visual_pos[node_id] = (ux, uy)
+            if node.node_kind == "CLUSTER_TOP":
+                visual_pos[node_id] = cluster_top_visual_pos(node)
+            else:
+                visual_pos[node_id] = (ux, uy)
 
         visiting.remove(node_id)
         return visual_pos[node_id]
 
-    dfs(root)
+    if root >= 0:
+        dfs(root)
+    else:
+        for child_id in source_children:
+            dfs(child_id)
     return visual_pos
 
 
@@ -511,18 +677,27 @@ def draw_grid_tree(
     root: int,
     nodes: Dict[int, Node],
     leaf_info: Dict[int, LeafInfo],
-    edges: List[Tuple[int, int]],
+    edges: List[Edge],
     width: int,
     height: int,
     source_pos: Tuple[float, float],
+    source_children: List[int],
 ) -> None:
-    visual_pos = compute_grid_visual_pos(root, nodes, leaf_info)
+    visual_pos = compute_grid_visual_pos(root, nodes, leaf_info, source_pos,
+                                         width, height, source_children)
     num_sinks = max(1, len(leaf_info))
     sink_font_size = max(3, min(6, int(70 / num_sinks)))
     visited = set()
 
-    ax.set_xlim(0, width)
-    ax.set_ylim(0, height)
+    if visual_pos:
+        xs = [source_pos[0], 0.0, float(width)] + [pos[0] for pos in visual_pos.values()]
+        ys = [source_pos[1], 0.0, float(height)] + [pos[1] for pos in visual_pos.values()]
+        pad = max(2.0, 0.02 * float(max(width, height)))
+        ax.set_xlim(min(xs) - pad, max(xs) + pad)
+        ax.set_ylim(min(ys) - pad, max(ys) + pad)
+    else:
+        ax.set_xlim(0, width)
+        ax.set_ylim(0, height)
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, linewidth=0.5, alpha=0.4)
     ax.set_title("Tree on Die Grid")
@@ -552,8 +727,13 @@ def draw_grid_tree(
             ax.plot([px, cx], [py, cy], color="black", linewidth=2.8, zorder=1)
             draw_branch(child_id)
 
-    draw_branch(root)
-    root_pos = visual_pos.get(root)
+    if root >= 0:
+        draw_branch(root)
+    else:
+        for child_id in source_children:
+            draw_branch(child_id)
+
+    root_pos = visual_pos.get(root) if root >= 0 else None
     if root_pos is not None:
         ax.plot(
             [source_pos[0], root_pos[0]],
@@ -562,6 +742,19 @@ def draw_grid_tree(
             linewidth=2.8,
             zorder=1,
         )
+    elif source_children:
+        for child_id in source_children:
+            child_pos = visual_pos.get(child_id)
+            if child_pos is None:
+                warn(f"source-to-child connection skipped because child {child_id} visual position is missing")
+                continue
+            ax.plot(
+                [source_pos[0], child_pos[0]],
+                [source_pos[1], child_pos[1]],
+                color="black",
+                linewidth=2.8,
+                zorder=1,
+            )
     else:
         warn(f"source-to-root connection skipped because root visual position is missing")
 
@@ -656,13 +849,14 @@ def main() -> None:
     if not os.path.exists(sample_path):
         fail(f"sample file not found: {sample_path}")
 
-    root, nodes, leaf_info, edges = parse_tree_file(tree_path)
+    root, nodes, leaf_info, edges, source_children = parse_tree_file(tree_path)
     width, height, source_x, source_y = parse_sample_file(sample_path)
     source_pos = (source_x, source_y)
-    max_est_skew = compute_max_est_skew(root, nodes, leaf_info, source_pos)
+    max_est_skew = compute_max_est_skew(root, nodes, leaf_info, source_pos,
+                                        source_children)
     print(f"max_est_skew = {max_est_skew:.3f}")
     num_leaves = max(1, len(leaf_info))
-    max_depth = compute_tree_depth(root, nodes)
+    max_depth = compute_tree_depth(root, nodes, source_children)
 
     if "MPLCONFIGDIR" not in os.environ:
         try:
@@ -687,8 +881,9 @@ def main() -> None:
         layout="constrained",
         gridspec_kw={"width_ratios": [1.4, 1.0]},
     )
-    draw_topology(ax1, root, nodes, leaf_info, edges)
-    draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height, source_pos)
+    draw_topology(ax1, root, nodes, leaf_info, edges, source_pos, source_children)
+    draw_grid_tree(ax2, root, nodes, leaf_info, edges, width, height,
+                   source_pos, source_children)
     fig.suptitle(f"Topology Tree Visualization: {sample_base} | max_est_skew={max_est_skew:.3f}")
 
     backend = plt.get_backend().lower()
