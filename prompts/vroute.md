@@ -409,9 +409,16 @@ bbox 用于 debug，不能影响 route/node 绘制。
 
 ```bash
 python3 vroute.py 3 --show-unrouted-topology
+
+用于弹窗显示图片：
+
+```bash
+python3 vroute.py 3 --show
 ```
 
-用途：检查 router 是否漏 route 某些 topology edge。
+用途：
+- `--show`：将生成的图片在交互式窗口中弹出显示，不再仅限于保存到文件。
+- `--show-unrouted-topology`：检查 router 是否漏 route 某些 topology edge。
 
 实现：
 

@@ -123,6 +123,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="draw topology edges that are not present in routed output",
     )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="show the plot in an interactive window",
+    )
     return parser.parse_args()
 
 
@@ -698,11 +703,15 @@ def plot_routes(
     ax.legend(handles=legend_handles, loc="best", fontsize=8, framealpha=0.92, ncol=2)
 
     fig.savefig(out_path, dpi=220)
+    if args.show:
+        plt.show()
     plt.close(fig)
 
 
 def main() -> None:
     args = parse_args()
+    if args.show:
+        plt.switch_backend("TkAgg")
     paths = infer_paths(args.sample_id)
 
     print(f"[VROUTE] route file: {paths['route']}")
