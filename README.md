@@ -8,7 +8,7 @@ partition -> topology generation -> DME bottom-up -> DME top-down allocation -> 
 
 # 优先级
 
-合法可布线性 > skew 潜力 > wirelength > buffer cost
+合法可布线性 > skew 潜力 > buffer cost > wirelength
 
 ## 原因
 
