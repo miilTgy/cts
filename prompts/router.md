@@ -187,26 +187,65 @@ route candidate 在最终被接受前，必须检查：
 
 ## 4. Preferred Access Direction
 
-对于有 bbox 的 node，preferred access direction 由 bbox 长边方向决定：
+> **⚠️ 关键约束：preferred direction 不是 binary 的 {LEFT,RIGHT} vs {UP,DOWN}，而是 tiered penalty：朝目标方向最优、垂直方向中等、反方向最差。**
 
-- 如果 `bbox_width >= bbox_height`，preferred directions = `{LEFT, RIGHT}`。
-- 如果 `bbox_height > bbox_width`，preferred directions = `{UP, DOWN}`。
-
-含义：bbox 平行于长边的方向是 preferred 接入方向。
-
-preferred 判断只看 route 最后一段/第一段的接入方向，与 route 是 I-shape、L-shape、Z-shape 还是 maze 无关。只要最终进入该 node 的方向属于 preferred directions，就认为该 node 使用了 preferred entry。对于从该 node 出发的边，也同理检查 exit direction。
-
-preferred 是 soft constraint，不是硬约束。score 中加入 non-preferred penalty：
+对于每条 edge `parent -> child`，先计算 **dominant geometric direction**——从 parent 指向 child 的首要方向：
 
 ```text
-score += parent_non_preferred_penalty if parent_exit_dir not in parent.preferred_dirs
-score += child_non_preferred_penalty  if child_entry_dir not in child.preferred_dirs
+dx = child.x - parent.x
+dy = child.y - parent.y
+
+dominant_dir =
+    RIGHT  if |dx| >= |dy| and dx > 0
+    LEFT   if |dx| >= |dy| and dx < 0
+    UP     if |dy| >  |dx| and dy > 0
+    DOWN   if |dy| >  |dx| and dy < 0
 ```
 
-建议：
-- ExternalAccessPatternThenMaze 的 preferred penalty 较大，使 access/bridge/top 尽量沿 bbox 长边方向接入。
-- LocalClusterPatternOnly 的 preferred penalty 较小，避免为了 preferred 过度绕线。
-- GlobalPatternThenMaze 的 preferred penalty 中等，同时保持 global 主干简洁。
+对于 parent **exit** direction，tiered penalty factor：
+
+| exit 方向 | 几何含义 | penalty_factor |
+|-----------|---------|---------------|
+| exit == dominant_dir | 直接朝 child 走 | **0.0** |
+| exit ⟂ dominant_dir（垂直） | 横切，需要再转一次弯 | **0.5** |
+| exit == opposite(dominant_dir) | 反向走，先远离 child | **1.0** |
+
+对于 child **entry** direction，symmetrically 使用同一个 `dominant_dir`，但参考方向是 **从 child 看 parent 的方向**（即 `opposite(dominant_dir)`）：
+
+| entry 方向 | 几何含义 | penalty_factor |
+|-----------|---------|---------------|
+| entry == opposite(dominant_dir) | 从 parent 所在侧自然进入 | **0.0** |
+| entry ⟂ opposite(dominant_dir)（垂直） | 横切进入 | **0.5** |
+| entry == dominant_dir | 从 parent 对面绕入 | **1.0** |
+
+例如 parent 在 child 上方（dominant_dir=DOWN），child 的理想 entry 是 UP（从上方自然接入），而非 DOWN（从下方绕入）。
+
+**反例**：bridge(123,162) → access(86,162)。dx=-37, dy=0。dominant_dir = **LEFT**。
+
+| exit | factor | 说明 |
+|------|--------|------|
+| LEFT | 0.0 | 直接朝 access |
+| UP/DOWN | 0.5 | 垂直横切 |
+| RIGHT | **1.0** | 反方向，先远离 access |
+
+旧 binary 模型中 LEFT 和 RIGHT 同为 preferred（因为 width≥height），导致 LEFT 被占后 router 选 RIGHT 绕大弯。新 tiered 模型中 RIGHT penalty 比 UP/DOWN 重一倍，router 会优先选垂直方向，为 top→bridge 保留更好的 port。
+
+preferred penalty 公式（soft constraint）：
+
+```text
+parent_preferred_penalty = penalty_weight * parent_exit_factor
+child_preferred_penalty  = penalty_weight * child_entry_factor
+```
+
+建议 penalty_weight：
+- ExternalAccessPatternThenMaze: 20.0
+- LocalClusterPatternOnly: 4.0
+- GlobalPatternThenMaze: 8.0
+
+bend_penalty_weight（仅 maze routing 使用）：
+- GlobalPatternThenMaze: 2.0
+- ExternalAccessPatternThenMaze: 1.0
+- LocalClusterPatternOnly: 0.5
 
 ---
 
@@ -233,6 +272,8 @@ VH: (x1, y1) -> (x1, y2) -> (x2, y2)
 
 ### 5.3 Z-shape
 
+> **⚠️ 两个硬约束：① wirelength 必须等于 Manhattan 距离；② canonicalize 后 bends 必须正好等于 2。bends > 2 的 candidate 是畸形 Z-shape 或未 correctly canonicalized 的退化 path，不是合法的 Z-shape，直接丢弃。**
+
 若主方向为 X，枚举若干 `xm`：
 
 ```text
@@ -245,6 +286,10 @@ VH: (x1, y1) -> (x1, y2) -> (x2, y2)
 (x1, y1) -> (x1, ym) -> (x2, ym) -> (x2, y2)
 ```
 
+`xm` 必须位于 `min(x1, x2)` 和 `max(x1, x2)` 之间（含端点）；`ym` 必须位于 `min(y1, y2)` 和 `max(y1, y2)` 之间（含端点）。**轨道超出端点范围的 candidate 不是 Z-shape，不得生成。**
+
+验证公式：对每个 Z-shape candidate，canonicalize 后计算 `total_wirelength` 和 `Manhattan = |x1-x2| + |y1-y2|`。若 `total_wirelength > Manhattan + EPS`，该 candidate 非法，直接丢弃。
+
 `xm/ym` 不要只取中点，应枚举：
 - midpoint。
 - source/global axis 附近 track。
@@ -254,6 +299,18 @@ VH: (x1, y1) -> (x1, y2) -> (x2, y2)
 - node loc 与 bbox 边界附近多级 safe track，例如 `±0.5 grid`、`±1 grid`、`±1.5 grid`、`±2 grid` 等。不要只枚举 `±0.5`；top/access 周围被短 stub 封住时，需要稍远一层 track 才能绕开。
 - 对 GlobalPatternThenMaze，还要额外枚举 source/global/root 轴附近的 safe track，避免全局主干只能走在 cluster 内部或刚好压住局部接入线。
 
+**Z-shape scoring 中鼓励中间边靠近两点 bbox 中央**：对于 Z-shape candidate，在 score 中加入 `z_center_penalty`，衡量 Z-shape 的中间段（两条平行段之间的垂直连接段）的轨道位置偏离 edge bbox 对应轴中心的距离：
+
+```text
+X 方向 Z: 中间段轨道为 x=xm，bbox 中心 c_x = (x1 + x2) / 2
+    z_center_penalty = weight_z_center * abs(xm - c_x)
+
+Y 方向 Z: 中间段轨道为 y=ym，bbox 中心 c_y = (y1 + y2) / 2
+    z_center_penalty = weight_z_center * abs(ym - c_y)
+```
+
+建议 `weight_z_center` 取值较小，仅用于 tie-break 同分 candidate（例如 `weight_z_center = 0.01 ~ 0.1`），防止 Z-shape 过度偏向某一端点侧面导致后续 route 没有对称绕过空间。
+
 pattern route 不应只枚举几何形状，还要枚举 endpoint ports：
 
 ```text
@@ -262,6 +319,8 @@ for each available parent_exit_dir:
     generate I/L/Z candidates whose first segment matches parent_exit_dir
     and whose last segment matches child_entry_dir
 ```
+
+> **⚠️ 迭代顺序决定 tie-break**：`parent_exit_dirs` 和 `child_entry_dirs` 必须分别按 `preferred_dir_factor` **升序**排序（factor=0.0 的 dominant_dir 排最前），确保当两个 candidate 总分相同时，dominant_dir 对应的 candidate 因先生成而被选中。不要按固定方向顺序（UP/DOWN/LEFT/RIGHT）迭代。
 
 如果 candidate 的第一段/最后一段方向与枚举 port 不一致，则丢弃。
 
@@ -381,28 +440,62 @@ candidate 不允许碰到非本 edge 的 node 或 route 中间点，避免隐式
 
 ## 7. Scoring
 
-所有合法 candidate 使用 score 选择最优：
+所有合法 candidate 使用 score 选择最优。
+
+**Pattern route（I/L/Z）scoring**：
 
 ```text
 score = wirelength
-      + bend_penalty * bends
-      + congestion_penalty
-      + bbox_penalty
-      + wrong_side_penalty
       + parent_non_preferred_penalty
       + child_non_preferred_penalty
-      + over_detour_penalty
+      + z_center_penalty          // Z-shape only: 中间段偏离 bbox 中心的距离
+```
+
+Pattern route **不包含 bend penalty**。I/L/Z 的线长已固定等于 Manhattan 距离，bend 数量已隐含在线长中。pattern 评分只看 preferred direction 和 Z-shape 中线位置。
+
+**Z-shape 优先于 L-shape（非 sink edge）**：对于 access/bridge/top/global 之间的 edge，Z-shape 可以让 parent exit 和 child entry **同时**为 preferred（factor=0.0 + 0.0），而 L-shape 最多只能一端 preferred、另一端垂直（0.0 + 0.5 或 0.5 + 0.0）。因此当 Z-shape 和 L-shape 线长相同时，Z-shape 因 preferred cost 更低而胜出，保证双端都从 preferred side 接入。
+
+**Maze route scoring**（仅在 pattern 全部失败后启用）：
+
+```text
+score = wirelength
+      + bend_penalty * bends       // maze 才惩罚 bend
+      + parent_non_preferred_penalty
+      + child_non_preferred_penalty
 ```
 
 非法情况，例如压 node、压 sink、越界、非法交叉、port 被占用，应该直接判 illegal，不参与 scoring。
 
-A* maze routing 只在 policy 允许时调用。A* 的 neighbor 是四方向 grid movement，需要记录前一个方向以计算 bend penalty。
+**Pattern candidate detour 硬约束**：所有 pattern candidate（I/L/Z）在 canonicalize 后，若 `wirelength > Manhattan_distance + EPS`，该 candidate 非法，直接丢弃。只有 maze fallback 允许 wirelength > Manhattan。
+
+### 7.5 Maze routing（双向 A*）
+
+当 pattern candidate 全部失败时，fallback 到 **双向 A\***（bidirectional A*）maze routing。
+
+双向 A* 同时从 parent 和 child 两端出发搜索，在中间汇合：
+
+```text
+forward  search: start = parent loc, expands toward child, bias toward preferred EXIT direction
+backward search: start = child  loc, expands toward parent, bias toward preferred ENTRY direction
+```
+
+**方向偏好（directional bias）**：
+
+- **forward search** 的第一步：`step_cost += factor * bend_weight`，其中 `factor = preferred_dir_factor(edge, step_dir, is_child_entry=false)`。这样 dominant_dir 方向步进 cost 更低，opposite 方向 cost 更高。
+- **backward search** 的第一步：同理，`factor = preferred_dir_factor(edge, rev_step_dir, is_child_entry=true)`。backward 是从 child 往回走，rev_step_dir 映射到子节点 entry 方向来判断偏好。
+- 后续步进不添加 directional bias，只保留普通 bend penalty。
+
+**state 定义**：`(point, prev_dir)`，与单向 A* 一致。两个搜索共享同一个 `best_g` 表和 `parent` 回溯表。任一搜索扩展到对方已访问的 state 时，两段拼接得到完整 path。
+
+**终止条件**：两个搜索的 frontier 相遇（任一 expansion 命中对方已探索 state），而不是各自跑到终点。拼接后 canonicalize 得到最终 polyline。
+
+双向 A* 保证两端都尽量从 preferred direction 接入，避免了单向 A* 从某侧乱绕的问题。
 
 对于 LocalClusterPatternOnly 的 maze fallback，必须使用 bounded local search window。窗口可以由当前 cluster bbox 与当前 edge endpoints 共同扩张得到，并 clamp 到 die boundary；不能让 local edge 全局乱绕。
 
 Pattern candidate 与 maze candidate 都必须走同一个 `check_legality()`，maze 找到 path 后不能直接 commit。
 
-为了调试一致性，pattern 生成出的多 bend Z/safe-track route 仍应标记为 `Z`，不要仅因为 canonicalized polyline 有 4 个以上点就标成 `MAZE`；只有 A* fallback 产生的 route 才标记 `MAZE`。
+为了调试一致性，pattern 生成出的多 bend Z/safe-track route 仍应标记为 `Z`，只有 A* fallback 产生的 route 才标记 `MAZE`。
 
 ---
 

@@ -62,5 +62,13 @@ int main(int argc, char** argv) {
         std::cout << "Router: wrote " << route_result.output_path << "\n";
     }
 
+    writer::WriterResult writer_result =
+        writer::write_solution(argv[1], problem, tree, loc_result, route_result);
+    if (!writer_result.valid) {
+        std::cerr << "Writer error: " << writer_result.error_msg << "\n";
+        return 1;
+    }
+    std::cout << "Wrote solution: " << writer_result.output_path << "\n";
+
     return 0;
 }

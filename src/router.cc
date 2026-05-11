@@ -127,6 +127,8 @@ struct Candidate {
     bool child_port_available = false;
     bool used_preferred_parent = false;
     bool used_preferred_child = false;
+    double parent_exit_factor = 1.0;
+    double child_entry_factor = 1.0;
     int expanded_nodes = 0;
     bool maze_used = false;
     std::string maze_failed_reason;
@@ -399,19 +401,27 @@ static bool is_manhattan_segment(const ScaledPoint& a, const ScaledPoint& b) {
     return a.x == b.x || a.y == b.y;
 }
 
-static bool is_preferred_dir(const common::TopoNode& node, Dir dir) {
+static Dir dominant_dir_between(const ScaledPoint& from,
+                                const ScaledPoint& to);
+
+static double preferred_dir_factor(const EdgeInfo& edge, Dir dir, bool is_child_entry) {
     if (dir == Dir::None) {
-        return false;
+        return 1.0;
     }
-    const int width = node.bbox.ux - node.bbox.lx;
-    const int height = node.bbox.uy - node.bbox.ly;
-    if (width <= 0 && height <= 0) {
-        return true;
+    Dir dom = dominant_dir_between(edge.start, edge.goal);
+    if (dom == Dir::None) {
+        return 0.0;
     }
-    if (width >= height) {
-        return dir == Dir::Left || dir == Dir::Right;
+    if (is_child_entry) {
+        dom = opposite(dom);
     }
-    return dir == Dir::Up || dir == Dir::Down;
+    if (dir == dom) {
+        return 0.0;
+    }
+    if (dir == opposite(dom)) {
+        return 1.0;
+    }
+    return 0.5;
 }
 
 static Dir dominant_dir_between(const ScaledPoint& from,
@@ -1132,66 +1142,86 @@ static Candidate run_maze_search(const EdgeInfo& edge,
         return false;
     };
 
-    std::priority_queue<AStarNode, std::vector<AStarNode>, AStarCompare> pq;
-    std::unordered_map<ScaledState, long long, ScaledStateHash> best_g;
-    std::unordered_map<ScaledState, ScaledState, ScaledStateHash> parent;
-
-    const ScaledState start_state{edge.start, Dir::None};
-    pq.push(AStarNode{start_state, 0, heuristic_cost(edge.start, edge.goal)});
-    best_g[start_state] = 0;
-
-    const std::array<std::pair<Dir, ScaledPoint>, 4> moves{{
+    static const std::array<std::pair<Dir, ScaledPoint>, 4> moves_list{{
         {Dir::Up, ScaledPoint{0, 1}},
         {Dir::Down, ScaledPoint{0, -1}},
         {Dir::Left, ScaledPoint{-1, 0}},
         {Dir::Right, ScaledPoint{1, 0}},
     }};
 
-    int expanded = 0;
-    bool found = false;
-    ScaledState goal_state{edge.goal, Dir::None};
+    std::priority_queue<AStarNode, std::vector<AStarNode>, AStarCompare> pq_fwd;
+    std::priority_queue<AStarNode, std::vector<AStarNode>, AStarCompare> pq_bwd;
+    std::unordered_map<ScaledState, long long, ScaledStateHash> best_g_fwd;
+    std::unordered_map<ScaledState, long long, ScaledStateHash> best_g_bwd;
+    std::unordered_map<ScaledState, ScaledState, ScaledStateHash> parent_fwd;
+    std::unordered_map<ScaledState, ScaledState, ScaledStateHash> parent_bwd;
+    std::unordered_map<PointKey, long long, PointKeyHash> point_best_fwd;
+    std::unordered_map<PointKey, long long, PointKeyHash> point_best_bwd;
+    std::unordered_map<PointKey, ScaledState, PointKeyHash> best_state_fwd;
+    std::unordered_map<PointKey, ScaledState, PointKeyHash> best_state_bwd;
 
-    while (!pq.empty()) {
-        const AStarNode cur = pq.top();
-        pq.pop();
-        ++expanded;
+    int expanded_fwd = 0;
+    int expanded_bwd = 0;
+    bool found_meeting = false;
+    ScaledState meeting_fwd;
+    ScaledState meeting_bwd;
+    long long meeting_cost = 0;
 
+    auto expand_step = [&](const AStarNode& cur,
+                           const ScaledPoint& goal,
+                           std::priority_queue<AStarNode, std::vector<AStarNode>, AStarCompare>& pq,
+                           std::unordered_map<ScaledState, long long, ScaledStateHash>& best_g,
+                           std::unordered_map<ScaledState, ScaledState, ScaledStateHash>& parent_map,
+                           bool is_forward,
+                           int& expanded,
+                           bool& found_meeting,
+                           ScaledState& meeting_fwd,
+                           ScaledState& meeting_bwd,
+                           long long& meeting_cost) {
         const auto it_best = best_g.find(cur.state);
         if (it_best == best_g.end() || cur.g != it_best->second) {
-            continue;
+            return;
         }
 
-        if (same_point(cur.state.point, edge.goal)) {
-            found = true;
-            goal_state = cur.state;
-            break;
+        if (same_point(cur.state.point, goal)) {
+            found_meeting = true;
+            meeting_fwd = (is_forward ? cur.state : ScaledState{goal, Dir::None});
+            meeting_bwd = (is_forward ? ScaledState{goal, Dir::None} : cur.state);
+            meeting_cost = cur.g;
+            return;
         }
 
-        for (const auto& move : moves) {
+        for (const auto& move : moves_list) {
             const Dir dir = move.first;
             const ScaledPoint next{
                 cur.state.point.x + move.second.x,
                 cur.state.point.y + move.second.y,
             };
             if (!in_die(next, problem.die_width, problem.die_height, scale) &&
-                !same_point(next, edge.goal)) {
+                !same_point(next, goal)) {
                 continue;
             }
             if (restrict_to_allowed_bbox && allowed_bbox != nullptr &&
-                !same_point(next, edge.goal) &&
+                !same_point(next, goal) &&
                 (next.x < allowed_bbox->lx || next.x > allowed_bbox->ux ||
                  next.y < allowed_bbox->ly || next.y > allowed_bbox->uy)) {
                 continue;
             }
-            if (!same_point(next, edge.goal) && blocked(next)) {
+            if (!same_point(next, goal) && blocked(next)) {
                 continue;
             }
             long long step_cost = 1;
             if (cur.state.prev_dir != Dir::None && cur.state.prev_dir != dir) {
                 step_cost += bend_weight;
             }
+            if (cur.state.prev_dir == Dir::None) {
+                const double factor =
+                    is_forward ? preferred_dir_factor(edge, dir, false)
+                               : preferred_dir_factor(edge, dir, true);
+                step_cost += static_cast<long long>(factor * static_cast<double>(bend_weight));
+            }
             if (edge.policy != Policy::LocalClusterPatternOnly &&
-                !same_point(next, edge.goal) &&
+                !same_point(next, goal) &&
                 point_inside_forbidden_bbox(next, edge, node_bboxes, topo_nodes)) {
                 step_cost += std::max(1, bend_weight * 2);
             }
@@ -1202,36 +1232,103 @@ static Candidate run_maze_search(const EdgeInfo& edge,
                 continue;
             }
             best_g[next_state] = tentative_g;
-            parent[next_state] = cur.state;
-            const long long f = tentative_g + heuristic_cost(next, edge.goal);
+            parent_map[next_state] = cur.state;
+            const long long f = tentative_g + heuristic_cost(next, goal);
             pq.push(AStarNode{next_state, tentative_g, f});
+
+            const PointKey pk = to_key(next);
+            const auto other_point_it =
+                is_forward ? point_best_bwd.find(pk) : point_best_fwd.find(pk);
+            if (other_point_it != (is_forward ? point_best_bwd.end() : point_best_fwd.end())) {
+                found_meeting = true;
+                meeting_fwd = (is_forward ? next_state : best_state_fwd[pk]);
+                meeting_bwd = (is_forward ? best_state_bwd[pk] : next_state);
+                meeting_cost = tentative_g + other_point_it->second;
+                return;
+            }
+            auto& point_map = is_forward ? point_best_fwd : point_best_bwd;
+            auto& state_map = is_forward ? best_state_fwd : best_state_bwd;
+            const auto pt_it = point_map.find(pk);
+            if (pt_it == point_map.end() || tentative_g < pt_it->second) {
+                point_map[pk] = tentative_g;
+                state_map[pk] = next_state;
+            }
+            (void)expanded;
+        }
+    };
+
+    const ScaledState start_state{edge.start, Dir::None};
+    const ScaledState goal_state{edge.goal, Dir::None};
+    pq_fwd.push(AStarNode{start_state, 0, heuristic_cost(edge.start, edge.goal)});
+    pq_bwd.push(AStarNode{goal_state, 0, heuristic_cost(edge.goal, edge.start)});
+    best_g_fwd[start_state] = 0;
+    best_g_bwd[goal_state] = 0;
+    point_best_fwd[to_key(edge.start)] = 0;
+    point_best_bwd[to_key(edge.goal)] = 0;
+
+    while (!pq_fwd.empty() || !pq_bwd.empty()) {
+        if (!pq_fwd.empty()) {
+            const AStarNode cur = pq_fwd.top();
+            pq_fwd.pop();
+            ++expanded_fwd;
+            expand_step(cur, edge.goal, pq_fwd, best_g_fwd, parent_fwd,
+                        true, expanded_fwd, found_meeting,
+                        meeting_fwd, meeting_bwd, meeting_cost);
+            if (found_meeting) break;
+        }
+        if (!pq_bwd.empty()) {
+            const AStarNode cur = pq_bwd.top();
+            pq_bwd.pop();
+            ++expanded_bwd;
+            expand_step(cur, edge.start, pq_bwd, best_g_bwd, parent_bwd,
+                        false, expanded_bwd, found_meeting,
+                        meeting_fwd, meeting_bwd, meeting_cost);
+            if (found_meeting) break;
         }
     }
 
-    cand.expanded_nodes = expanded;
-    if (!found) {
+    cand.expanded_nodes = expanded_fwd + expanded_bwd;
+    if (!found_meeting) {
         failure_reason = "NO_LEGAL_MAZE";
         cand.maze_failed_reason = failure_reason;
         return cand;
     }
 
-    std::vector<ScaledPoint> reversed;
-    ScaledState walk = goal_state;
-    reversed.push_back(walk.point);
-    while (!(walk == start_state)) {
-        const auto it = parent.find(walk);
-        if (it == parent.end()) {
-            failure_reason = "NO_LEGAL_MAZE";
-            cand.maze_failed_reason = failure_reason;
-            cand.points.clear();
-            return cand;
+    std::vector<ScaledPoint> path;
+    {
+        ScaledState walk = meeting_fwd;
+        std::vector<ScaledState> fwd_chain;
+        fwd_chain.push_back(walk);
+        while (!(walk == start_state)) {
+            const auto it = parent_fwd.find(walk);
+            if (it == parent_fwd.end()) break;
+            walk = it->second;
+            fwd_chain.push_back(walk);
         }
-        walk = it->second;
-        reversed.push_back(walk.point);
+        std::reverse(fwd_chain.begin(), fwd_chain.end());
+        for (const ScaledState& s : fwd_chain) {
+            path.push_back(s.point);
+        }
     }
-    std::reverse(reversed.begin(), reversed.end());
-    canonicalize_polyline(reversed);
-    cand.points = std::move(reversed);
+    if (!same_point(meeting_fwd.point, meeting_bwd.point)) {
+        path.push_back(meeting_bwd.point);
+    }
+    {
+        ScaledState walk = meeting_bwd;
+        std::vector<ScaledState> bwd_chain;
+        bwd_chain.push_back(walk);
+        while (!(walk == goal_state)) {
+            const auto it = parent_bwd.find(walk);
+            if (it == parent_bwd.end()) break;
+            walk = it->second;
+            bwd_chain.push_back(walk);
+        }
+        for (std::size_t i = 1; i < bwd_chain.size(); ++i) {
+            path.push_back(bwd_chain[i].point);
+        }
+    }
+    canonicalize_polyline(path);
+    cand.points = std::move(path);
     cand.shape = Shape::Maze;
     cand.wirelength = wirelength_of_polyline(cand.points, scale);
     cand.bends = bends_of_polyline(cand.points);
@@ -1257,15 +1354,15 @@ static double preferred_penalty_weight(Policy policy) {
 static double bend_penalty_weight(Policy policy) {
     switch (policy) {
         case Policy::GlobalPatternThenMaze:
-            return 8.0;
+            return 2.0;
         case Policy::ExternalAccessPatternThenMaze:
-            return 6.0;
+            return 1.0;
         case Policy::LocalClusterPatternOnly:
-            return 3.0;
+            return 0.5;
         case Policy::Unknown:
-            return 5.0;
+            return 1.0;
     }
-    return 5.0;
+    return 1.0;
 }
 
 static Shape shape_from_polyline(const std::vector<ScaledPoint>& points) {
@@ -1481,18 +1578,26 @@ static bool evaluate_candidate(
         return false;
     }
 
-    if (edge.parent_is_source) {
-        cand.used_preferred_parent = true;
-    } else {
-        const common::TopoNode& parent_node =
-            topo_nodes[static_cast<std::size_t>(edge.parent)];
-        cand.used_preferred_parent = is_preferred_dir(parent_node, parent_exit);
-    }
-    const common::TopoNode& child_node = topo_nodes[static_cast<std::size_t>(edge.child)];
-    cand.used_preferred_child = is_preferred_dir(child_node, child_entry);
+    cand.parent_exit_factor = preferred_dir_factor(edge, parent_exit, false);
+    cand.child_entry_factor = preferred_dir_factor(edge, child_entry, true);
+    cand.used_preferred_parent = (cand.parent_exit_factor <= EPS);
+    cand.used_preferred_child = (cand.child_entry_factor <= EPS);
 
     cand.wirelength = wirelength_of_polyline(cand.points, scale);
     cand.bends = bends_of_polyline(cand.points);
+    if (!cand.maze_used) {
+        const double direct = static_cast<double>(edge.manhattan_distance) / scale;
+        if (cand.wirelength > direct + EPS) {
+            ++reject_stats["PATTERN_DETOUR"];
+            failure_reason = "PATTERN_DETOUR";
+            return false;
+        }
+        if (cand.bends > 2) {
+            ++reject_stats["ZSHAPE_BENDS"];
+            failure_reason = "ZSHAPE_BENDS";
+            return false;
+        }
+    }
     const double penalty = preferred_penalty_weight(edge.policy);
     const double bend_weight = bend_penalty_weight(edge.policy);
     const double direct_distance = static_cast<double>(edge.manhattan_distance) / scale;
@@ -1504,12 +1609,24 @@ static bool evaluate_candidate(
                 bbox_penalty += preferred_penalty_weight(edge.policy) * 0.5;
             }
     }
-    double preferred_cost = 0.0;
-    if (!cand.used_preferred_parent) {
-        preferred_cost += penalty;
-    }
-    if (!cand.used_preferred_child) {
-        preferred_cost += penalty;
+    double preferred_cost = penalty * (cand.parent_exit_factor + cand.child_entry_factor);
+    double z_center_penalty = 0.0;
+    if (cand.points.size() == 4U && cand.bends >= 2 &&
+        !cand.maze_used) {
+        const ScaledPoint& p1 = cand.points[1U];
+        const ScaledPoint& p2 = cand.points[2U];
+        constexpr double weight_z_center = 0.05;
+        if (p1.x == p2.x) {
+            const long long xm = p1.x;
+            const long long cx = (edge.start.x + edge.goal.x) / 2LL;
+            z_center_penalty = weight_z_center *
+                static_cast<double>(std::llabs(xm - cx)) / scale;
+        } else if (p1.y == p2.y) {
+            const long long ym = p1.y;
+            const long long cy = (edge.start.y + edge.goal.y) / 2LL;
+            z_center_penalty = weight_z_center *
+                static_cast<double>(std::llabs(ym - cy)) / scale;
+        }
     }
     double reserved_top_port_cost = 0.0;
     if (edge.policy == Policy::ExternalAccessPatternThenMaze) {
@@ -1569,8 +1686,10 @@ static bool evaluate_candidate(
             }
         }
     }
-    cand.score = cand.wirelength + bend_weight * cand.bends + preferred_cost +
-                 detour_penalty + bbox_penalty + reserved_top_port_cost;
+    cand.score = cand.wirelength +
+                  (cand.maze_used ? bend_weight * cand.bends : 0.0) +
+                  preferred_cost + detour_penalty + bbox_penalty +
+                  z_center_penalty + reserved_top_port_cost;
     cand.shape = cand.maze_used ? Shape::Maze : shape_from_polyline(cand.points);
     return true;
 }
@@ -2072,11 +2191,23 @@ RouterResult run(const common::Problem& problem,
             (edge.has_cluster_bbox && edge.cluster_top >= 0)
                 ? &node_bboxes[static_cast<std::size_t>(edge.cluster_top)]
                 : nullptr;
-        const std::vector<Dir> parent_dirs =
+        const std::vector<Dir> parent_dirs_unsorted =
             edge.parent_is_source ? available_dirs(source_ports)
                                   : available_dirs(node_ports[static_cast<std::size_t>(edge.parent)]);
-        const std::vector<Dir> child_dirs =
+        const std::vector<Dir> child_dirs_unsorted =
             available_dirs(node_ports[static_cast<std::size_t>(edge.child)]);
+        std::vector<Dir> parent_dirs = parent_dirs_unsorted;
+        std::vector<Dir> child_dirs = child_dirs_unsorted;
+        std::stable_sort(parent_dirs.begin(), parent_dirs.end(),
+                         [&edge](Dir a, Dir b) {
+                             return preferred_dir_factor(edge, a, false) <
+                                    preferred_dir_factor(edge, b, false);
+                         });
+        std::stable_sort(child_dirs.begin(), child_dirs.end(),
+                         [&edge](Dir a, Dir b) {
+                             return preferred_dir_factor(edge, a, true) <
+                                    preferred_dir_factor(edge, b, true);
+                         });
 
         const std::vector<std::vector<ScaledPoint>> pattern_candidates =
             generate_pattern_candidates(edge, node_points, node_bboxes,
