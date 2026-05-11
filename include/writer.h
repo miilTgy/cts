@@ -17,7 +17,7 @@ void debug_enable(bool enable);
 WriterResult write_solution(const std::string& input_path,
                             const common::Problem& problem,
                             const common::TopoTree& tree,
-                            const common::BottomUpResult& bu_result,
-                            const common::TopDownResult& td_result);
+                            const common::LocerResult& loc_result,
+                            const common::RouterResult& router_result);
 
 }  // namespace writer
