@@ -4,7 +4,14 @@
 
 # Buffered-DME (Deferred-Merge Embedding)
 
-partition -> topology generation -> DME bottom-up -> DME top-down allocation -> bottom-up route -> detour repair -> buffer insertion
+partition
+-> topology generation
+-> cluster loc
+    (DME bottom-up -> DME top-down allocation)
+-> global loc
+-> bottom-up route
+-> detour repair
+-> buffer insertion
 
 # 优先级
 
