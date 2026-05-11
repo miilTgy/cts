@@ -24,6 +24,10 @@ static const char* kind_to_string(common::NodeKind kind) {
             return "CLUSTER_INTERNAL";
         case common::NodeKind::ClusterAccess:
             return "CLUSTER_ACCESS";
+        case common::NodeKind::ClusterBridge:
+            return "CLUSTER_BRIDGE";
+        case common::NodeKind::ClusterTop:
+            return "CLUSTER_TOP";
         case common::NodeKind::Global:
             return "GLOBAL";
     }
@@ -150,8 +154,297 @@ static bool ensure_tree_dir() {
     return true;
 }
 
+static void swallow_access_internal_wrappers(common::TopoTree& tree) {
+    for (common::TopoNode& node : tree.nodes) {
+        const bool can_swallow =
+            (node.kind == common::NodeKind::ClusterAccess ||
+             node.kind == common::NodeKind::ClusterTop) &&
+            node.left >= 0 &&
+            node.right == -1 &&
+            static_cast<std::size_t>(node.left) < tree.nodes.size();
+        if (!can_swallow) continue;
+
+        common::TopoNode& child = tree.nodes[static_cast<std::size_t>(node.left)];
+        if (child.kind != common::NodeKind::ClusterInternal ||
+            child.left < 0 ||
+            child.right < 0) {
+            continue;
+        }
+
+        node.left = child.left;
+        node.right = child.right;
+        tree.nodes[static_cast<std::size_t>(node.left)].parent = node.id;
+        tree.nodes[static_cast<std::size_t>(node.right)].parent = node.id;
+        child.parent = -1;
+    }
+}
+
+static bool parent_absorbs_child(common::NodeKind parent,
+                                 common::NodeKind child) {
+    if (parent == common::NodeKind::ClusterTop) {
+        return child == common::NodeKind::ClusterBridge ||
+               child == common::NodeKind::ClusterAccess ||
+               child == common::NodeKind::ClusterInternal;
+    }
+    if (parent == common::NodeKind::ClusterBridge) {
+        return child == common::NodeKind::ClusterAccess ||
+               child == common::NodeKind::ClusterInternal;
+    }
+    if (parent == common::NodeKind::ClusterAccess) {
+        return child == common::NodeKind::ClusterInternal;
+    }
+    return false;
+}
+
+static bool child_replaces_parent(common::NodeKind parent,
+                                  common::NodeKind child) {
+    return child == common::NodeKind::Sink &&
+           (parent == common::NodeKind::ClusterAccess ||
+            parent == common::NodeKind::ClusterInternal);
+}
+
+static void replace_child_link(common::TopoTree& tree,
+                               int parent_id,
+                               int old_child,
+                               int new_child) {
+    if (parent_id < 0) return;
+    common::TopoNode& parent = tree.nodes[static_cast<std::size_t>(parent_id)];
+    if (parent.left == old_child) parent.left = new_child;
+    if (parent.right == old_child) parent.right = new_child;
+}
+
+static bool canonicalize_one_unary(common::TopoTree& tree, int& root) {
+    for (std::size_t i = 0; i < tree.nodes.size(); ++i) {
+        common::TopoNode& parent = tree.nodes[i];
+        if (parent.left < 0 || parent.right >= 0 ||
+            static_cast<std::size_t>(parent.left) >= tree.nodes.size()) {
+            continue;
+        }
+
+        common::TopoNode& child = tree.nodes[static_cast<std::size_t>(parent.left)];
+        if (parent_absorbs_child(parent.kind, child.kind)) {
+            const int old_child = child.id;
+            parent.left = child.left;
+            parent.right = child.right;
+            if (parent.left >= 0) {
+                tree.nodes[static_cast<std::size_t>(parent.left)].parent = parent.id;
+            }
+            if (parent.right >= 0) {
+                tree.nodes[static_cast<std::size_t>(parent.right)].parent = parent.id;
+            }
+            child.parent = -1;
+            child.left = -1;
+            child.right = -1;
+            if (g_debug_enabled) {
+                std::cout << "[TREER] canonicalize absorb parent="
+                          << parent.id << " child=" << old_child << "\n";
+            }
+            return true;
+        }
+
+        if (child_replaces_parent(parent.kind, child.kind)) {
+            const int parent_id = parent.id;
+            const int grandparent = parent.parent;
+            child.parent = grandparent;
+            if (grandparent >= 0) {
+                replace_child_link(tree, grandparent, parent_id, child.id);
+            } else {
+                root = child.id;
+            }
+            parent.parent = -1;
+            parent.left = -1;
+            parent.right = -1;
+            if (g_debug_enabled) {
+                std::cout << "[TREER] canonicalize replace parent="
+                          << parent_id << " child=" << child.id << "\n";
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void canonicalize_unary_nodes(common::TopoTree& tree, int& root) {
+    while (canonicalize_one_unary(tree, root)) {
+    }
+
+    if (!g_debug_enabled) return;
+    for (const common::TopoNode& node : tree.nodes) {
+        if (node.left >= 0 && node.right == -1) {
+            const common::TopoNode& child =
+                tree.nodes[static_cast<std::size_t>(node.left)];
+            if (!parent_absorbs_child(node.kind, child.kind) &&
+                !child_replaces_parent(node.kind, child.kind)) {
+                std::cout << "[TREER] canonicalize keep unary parent="
+                          << node.id << " kind=" << kind_to_string(node.kind)
+                          << " child=" << child.id
+                          << " child_kind=" << kind_to_string(child.kind) << "\n";
+            }
+        }
+    }
+}
+
+static void collect_reachable_nodes(const common::TopoTree& tree,
+                                    int node_id,
+                                    std::vector<int>& order,
+                                    std::vector<int>& visited) {
+    if (node_id < 0 ||
+        static_cast<std::size_t>(node_id) >= tree.nodes.size() ||
+        visited[static_cast<std::size_t>(node_id)] != 0) {
+        return;
+    }
+
+    visited[static_cast<std::size_t>(node_id)] = 1;
+    order.push_back(node_id);
+    const common::TopoNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
+    collect_reachable_nodes(tree, node.left, order, visited);
+    collect_reachable_nodes(tree, node.right, order, visited);
+}
+
+static void compact_to_reachable(common::TopoTree& tree, int root) {
+    if (root < 0 || static_cast<std::size_t>(root) >= tree.nodes.size()) return;
+
+    std::vector<int> order;
+    std::vector<int> visited(tree.nodes.size(), 0);
+    collect_reachable_nodes(tree, root, order, visited);
+
+    std::vector<int> remap(tree.nodes.size(), -1);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        remap[static_cast<std::size_t>(order[i])] = static_cast<int>(i);
+    }
+
+    std::vector<common::TopoNode> compacted;
+    compacted.reserve(order.size());
+    for (int old_id : order) {
+        common::TopoNode node = tree.nodes[static_cast<std::size_t>(old_id)];
+        node.id = remap[static_cast<std::size_t>(old_id)];
+        node.parent = node.parent >= 0 ? remap[static_cast<std::size_t>(node.parent)] : -1;
+        node.left = node.left >= 0 ? remap[static_cast<std::size_t>(node.left)] : -1;
+        node.right = node.right >= 0 ? remap[static_cast<std::size_t>(node.right)] : -1;
+        compacted.push_back(std::move(node));
+    }
+
+    tree.nodes = std::move(compacted);
+    tree.root = remap[static_cast<std::size_t>(root)];
+    tree.cluster_root = tree.root;
+}
+
+static void compact_to_source_children(common::TopoTree& tree,
+                                       const std::vector<int>& source_children) {
+    std::vector<int> order;
+    std::vector<int> visited(tree.nodes.size(), 0);
+    for (int child : source_children) {
+        collect_reachable_nodes(tree, child, order, visited);
+    }
+
+    std::vector<int> remap(tree.nodes.size(), -1);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        remap[static_cast<std::size_t>(order[i])] = static_cast<int>(i);
+    }
+
+    std::vector<common::TopoNode> compacted;
+    compacted.reserve(order.size());
+    for (int old_id : order) {
+        common::TopoNode node = tree.nodes[static_cast<std::size_t>(old_id)];
+        node.id = remap[static_cast<std::size_t>(old_id)];
+        node.parent = node.parent >= 0 ? remap[static_cast<std::size_t>(node.parent)] : -1;
+        node.left = node.left >= 0 ? remap[static_cast<std::size_t>(node.left)] : -1;
+        node.right = node.right >= 0 ? remap[static_cast<std::size_t>(node.right)] : -1;
+        compacted.push_back(std::move(node));
+    }
+
+    std::vector<int> remapped_source_children;
+    remapped_source_children.reserve(source_children.size());
+    for (int child : source_children) {
+        if (child >= 0 &&
+            static_cast<std::size_t>(child) < remap.size() &&
+            remap[static_cast<std::size_t>(child)] >= 0) {
+            remapped_source_children.push_back(remap[static_cast<std::size_t>(child)]);
+        }
+    }
+
+    tree.nodes = std::move(compacted);
+    tree.root = -1;
+    tree.cluster_root = -1;
+    tree.source_children = std::move(remapped_source_children);
+    for (int child : tree.source_children) {
+        tree.nodes[static_cast<std::size_t>(child)].parent = -1;
+    }
+}
+
+static void recompute_subtree(common::TopoTree& tree, int node_id) {
+    common::TopoNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
+    if (node.is_sink) {
+        node.left = -1;
+        node.right = -1;
+        node.sink_indices = {node.sink_index};
+        node.subtree_min_delay_to_node = 0;
+        node.subtree_max_delay_to_node = 0;
+        node.subtree_skew_to_node = 0;
+        node.left_min_delay_to_node = 0;
+        node.left_max_delay_to_node = 0;
+        node.left_skew_to_node = 0;
+        node.right_min_delay_to_node = 0;
+        node.right_max_delay_to_node = 0;
+        node.right_skew_to_node = 0;
+        return;
+    }
+
+    if (node.left >= 0) {
+        tree.nodes[static_cast<std::size_t>(node.left)].parent = node_id;
+        recompute_subtree(tree, node.left);
+    }
+    if (node.right >= 0) {
+        tree.nodes[static_cast<std::size_t>(node.right)].parent = node_id;
+        recompute_subtree(tree, node.right);
+    }
+
+    const common::TopoNode left =
+        tree.nodes[static_cast<std::size_t>(node.left)];
+    node.bbox = left.bbox;
+    node.sink_indices = left.sink_indices;
+    const int left_edge = manhattan(node.loc, left.loc);
+    node.left_min_delay_to_node = left.subtree_min_delay_to_node + left_edge;
+    node.left_max_delay_to_node = left.subtree_max_delay_to_node + left_edge;
+    node.left_skew_to_node = node.left_max_delay_to_node - node.left_min_delay_to_node;
+
+    if (node.right >= 0) {
+        const common::TopoNode right =
+            tree.nodes[static_cast<std::size_t>(node.right)];
+        node.bbox = union_bbox(left.bbox, right.bbox);
+        node.sink_indices.insert(node.sink_indices.end(),
+                                 right.sink_indices.begin(),
+                                 right.sink_indices.end());
+        std::sort(node.sink_indices.begin(), node.sink_indices.end());
+        update_delay_fields(node, left, right);
+    } else {
+        node.right_min_delay_to_node = 0;
+        node.right_max_delay_to_node = 0;
+        node.right_skew_to_node = 0;
+        node.subtree_min_delay_to_node = node.left_min_delay_to_node;
+        node.subtree_max_delay_to_node = node.left_max_delay_to_node;
+        node.subtree_skew_to_node = node.left_skew_to_node;
+    }
+}
+
+static int canonicalize_local_tree(common::TopoTree& tree) {
+    if (tree.cluster_root < 0) return -1;
+    swallow_access_internal_wrappers(tree);
+    int root = tree.cluster_root;
+    canonicalize_unary_nodes(tree, root);
+    tree.cluster_root = root;
+    compact_to_reachable(tree, tree.cluster_root);
+    if (tree.root >= 0) {
+        tree.nodes[static_cast<std::size_t>(tree.root)].parent = -1;
+        recompute_subtree(tree, tree.root);
+        tree.nodes[static_cast<std::size_t>(tree.root)].parent = -1;
+    }
+    return tree.cluster_root;
+}
+
 static int append_local_tree(common::TopoTree& global,
-                             const common::TopoTree& local) {
+                             common::TopoTree local) {
+    canonicalize_local_tree(local);
     const int offset = static_cast<int>(global.nodes.size());
     for (const common::TopoNode& old_node : local.nodes) {
         common::TopoNode node = old_node;
@@ -164,37 +457,40 @@ static int append_local_tree(common::TopoTree& global,
     return local.cluster_root + offset;
 }
 
-static int merge_child_roots(std::vector<int> roots,
-                             common::Point external_target,
-                             common::TopoTree& tree,
-                             const common::Problem& problem) {
-    if (roots.empty()) return -1;
-    if (roots.size() == 1) return roots[0];
+static bool is_leaf_representative(const common::TopoTree& tree, int node_id) {
+    return node_id >= 0 &&
+           static_cast<std::size_t>(node_id) < tree.nodes.size() &&
+           tree.nodes[static_cast<std::size_t>(node_id)].kind ==
+               common::NodeKind::ClusterTop;
+}
 
-    std::stable_sort(roots.begin(), roots.end(), [&](int a, int b) {
-        const common::Point& pa = tree.nodes[static_cast<std::size_t>(a)].loc;
-        const common::Point& pb = tree.nodes[static_cast<std::size_t>(b)].loc;
-        const int da = manhattan(pa, external_target);
-        const int db = manhattan(pb, external_target);
-        if (da != db) return da < db;
-        if (pa.x != pb.x) return pa.x < pb.x;
-        if (pa.y != pb.y) return pa.y < pb.y;
-        return a < b;
-    });
-
-    while (roots.size() > 1) {
-        std::vector<int> next;
-        for (std::size_t i = 0; i < roots.size(); i += 2) {
-            if (i + 1 >= roots.size()) {
-                next.push_back(roots[i]);
-                continue;
-            }
-            next.push_back(create_parent(tree, roots[i], roots[i + 1],
-                                         external_target, problem));
-        }
-        roots = std::move(next);
+[[maybe_unused]] static void absorb_source_root_if_global(common::TopoTree& tree, int root) {
+    tree.source_children.clear();
+    if (root < 0 ||
+        static_cast<std::size_t>(root) >= tree.nodes.size() ||
+        tree.nodes[static_cast<std::size_t>(root)].kind != common::NodeKind::Global) {
+        return;
     }
-    return roots[0];
+
+    const common::TopoNode root_node = tree.nodes[static_cast<std::size_t>(root)];
+    std::vector<int> children;
+    if (root_node.left >= 0) children.push_back(root_node.left);
+    if (root_node.right >= 0) children.push_back(root_node.right);
+    if (children.empty()) return;
+
+    for (int child : children) {
+        tree.nodes[static_cast<std::size_t>(child)].parent = -1;
+    }
+    tree.nodes[static_cast<std::size_t>(root)].left = -1;
+    tree.nodes[static_cast<std::size_t>(root)].right = -1;
+
+    if (g_debug_enabled) {
+        std::cout << "[TREER] source absorbed root Global " << root
+                  << " children=";
+        for (int child : children) std::cout << child << " ";
+        std::cout << "\n";
+    }
+    compact_to_source_children(tree, children);
 }
 
 static void write_node_line(std::ostream& out, const common::TopoNode& node) {
@@ -221,6 +517,8 @@ static bool write_tree_file(const common::TopoTree& tree,
 
     fout << "TREE_VALID " << (tree.valid ? 1 : 0) << "\n";
     fout << "ROOT " << tree.root << "\n";
+    fout << "SOURCE " << problem.source.loc.x << " "
+         << problem.source.loc.y << "\n";
     fout << "NUM_NODES " << tree.nodes.size() << "\n";
     fout << "NUM_SINKS " << problem.sinks.size() << "\n\n";
 
@@ -247,7 +545,243 @@ static bool write_tree_file(const common::TopoTree& tree,
             if (node.right >= 0) fout << "EDGE " << node.id << " " << node.right << "\n";
         }
     }
+    if (tree.root >= 0) {
+        fout << "EDGE SRC " << tree.root << "\n";
+    } else {
+        for (int child : tree.source_children) {
+            fout << "EDGE SRC " << child << "\n";
+        }
+    }
     return true;
+}
+
+struct ClusterRootInfo {
+    int node_id = -1;
+    common::BBox bbox;
+    common::Point loc;
+};
+
+static common::Point bbox_center(const common::BBox& bbox) {
+    common::Point p;
+    p.x = (bbox.lx + bbox.ux) / 2;
+    p.y = (bbox.ly + bbox.uy) / 2;
+    return p;
+}
+
+static common::BBox bbox_union_many(const std::vector<ClusterRootInfo>& roots) {
+    if (roots.empty()) return {0, 0, 0, 0};
+    common::BBox bbox = roots.front().bbox;
+    for (std::size_t i = 1; i < roots.size(); ++i) {
+        bbox = union_bbox(bbox, roots[i].bbox);
+    }
+    return bbox;
+}
+
+enum class SweepAxis {
+    X,
+    Y
+};
+
+enum class SourceRelation {
+    Left,
+    Right,
+    Below,
+    Above,
+    Inside
+};
+
+static SourceRelation classify_source_relation(const common::Point& source,
+                                               const common::BBox& union_bbox) {
+    if (source.x < union_bbox.lx) return SourceRelation::Left;
+    if (source.x > union_bbox.ux) return SourceRelation::Right;
+    if (source.y < union_bbox.ly) return SourceRelation::Below;
+    if (source.y > union_bbox.uy) return SourceRelation::Above;
+    return SourceRelation::Inside;
+}
+
+static SweepAxis pick_primary_axis(const common::BBox& union_bbox) {
+    const int width = union_bbox.ux - union_bbox.lx;
+    const int height = union_bbox.uy - union_bbox.ly;
+    return width >= height ? SweepAxis::X : SweepAxis::Y;
+}
+
+static bool compare_root_by_relation(const ClusterRootInfo& a,
+                                     const ClusterRootInfo& b,
+                                     SourceRelation relation,
+                                     SweepAxis axis,
+                                     const common::Point& source) {
+    const int ax2 = a.loc.x * 2;
+    const int ay2 = a.loc.y * 2;
+    const int bx2 = b.loc.x * 2;
+    const int by2 = b.loc.y * 2;
+    auto tie_id = [&](const ClusterRootInfo& lhs, const ClusterRootInfo& rhs) {
+        return lhs.node_id < rhs.node_id;
+    };
+
+    if (relation == SourceRelation::Left) {
+        if (ax2 != bx2) return ax2 < bx2;
+        if (ay2 != by2) return ay2 > by2;
+        return tie_id(a, b);
+    }
+    if (relation == SourceRelation::Right) {
+        if (ax2 != bx2) return ax2 > bx2;
+        if (ay2 != by2) return ay2 > by2;
+        return tie_id(a, b);
+    }
+    if (relation == SourceRelation::Below) {
+        if (ay2 != by2) return ay2 < by2;
+        if (ax2 != bx2) return ax2 < bx2;
+        return tie_id(a, b);
+    }
+    if (relation == SourceRelation::Above) {
+        if (ay2 != by2) return ay2 > by2;
+        if (ax2 != bx2) return ax2 < bx2;
+        return tie_id(a, b);
+    }
+
+    if (axis == SweepAxis::X) {
+        const bool a_left = a.loc.x < source.x ||
+                            (a.loc.x == source.x && a.loc.y <= source.y);
+        const bool b_left = b.loc.x < source.x ||
+                            (b.loc.x == source.x && b.loc.y <= source.y);
+        if (a_left != b_left) return a_left;
+        if (a_left) {
+            if (ax2 != bx2) return ax2 < bx2;
+            if (ay2 != by2) return ay2 > by2;
+            return tie_id(a, b);
+        }
+        if (ax2 != bx2) return ax2 > bx2;
+        if (ay2 != by2) return ay2 > by2;
+        return tie_id(a, b);
+    }
+
+    const bool a_below = a.loc.y < source.y ||
+                         (a.loc.y == source.y && a.loc.x <= source.x);
+    const bool b_below = b.loc.y < source.y ||
+                         (b.loc.y == source.y && b.loc.x <= source.x);
+    if (a_below != b_below) return a_below;
+    if (a_below) {
+        if (ay2 != by2) return ay2 < by2;
+        if (ax2 != bx2) return ax2 < bx2;
+        return tie_id(a, b);
+    }
+    if (ay2 != by2) return ay2 > by2;
+    if (ax2 != bx2) return ax2 < bx2;
+    return tie_id(a, b);
+}
+
+static int create_global_parent(common::TopoTree& tree,
+                                int left_id,
+                                int right_id,
+                                common::Point external_target,
+                                const common::Problem& problem) {
+    return create_parent(tree, left_id, right_id, external_target, problem);
+}
+
+static int build_chain_from_ordered_roots(common::TopoTree& tree,
+                                         const std::vector<int>& ordered_roots,
+                                         const common::Problem& problem,
+                                         common::Point external_target) {
+    if (ordered_roots.empty()) return -1;
+    if (ordered_roots.size() == 1) return ordered_roots.front();
+
+    int root = ordered_roots.back();
+    for (std::size_t i = ordered_roots.size() - 1; i-- > 0;) {
+        root = create_global_parent(tree, ordered_roots[i], root,
+                                    external_target, problem);
+        if (root < 0) return -1;
+    }
+    return root;
+}
+
+static int build_source_aware_global_tree(common::TopoTree& tree,
+                                          const common::Problem& problem,
+                                          const std::vector<int>& cluster_roots) {
+    if (cluster_roots.empty()) return -1;
+    if (cluster_roots.size() == 1) return cluster_roots.front();
+
+    std::vector<ClusterRootInfo> roots;
+    roots.reserve(cluster_roots.size());
+    for (int root_id : cluster_roots) {
+        if (root_id < 0 ||
+            static_cast<std::size_t>(root_id) >= tree.nodes.size()) {
+            continue;
+        }
+        const common::TopoNode& node = tree.nodes[static_cast<std::size_t>(root_id)];
+        roots.push_back({root_id, node.bbox, bbox_center(node.bbox)});
+    }
+    if (roots.empty()) return -1;
+    if (roots.size() == 1) return roots.front().node_id;
+
+    const common::BBox union_bbox = bbox_union_many(roots);
+    const SourceRelation relation =
+        classify_source_relation(problem.source.loc, union_bbox);
+    const SweepAxis axis = pick_primary_axis(union_bbox);
+
+    auto sort_group = [&](std::vector<ClusterRootInfo>& group) {
+        std::stable_sort(group.begin(), group.end(),
+                         [&](const ClusterRootInfo& a, const ClusterRootInfo& b) {
+            return compare_root_by_relation(a, b, relation, axis, problem.source.loc);
+        });
+    };
+
+    if (relation == SourceRelation::Inside) {
+        std::vector<ClusterRootInfo> neg;
+        std::vector<ClusterRootInfo> pos;
+        neg.reserve(roots.size());
+        pos.reserve(roots.size());
+
+        for (const ClusterRootInfo& info : roots) {
+            if (axis == SweepAxis::X) {
+                const bool negative = info.loc.x < problem.source.loc.x ||
+                                      (info.loc.x == problem.source.loc.x &&
+                                       info.loc.y <= problem.source.loc.y);
+                if (negative) {
+                    neg.push_back(info);
+                } else {
+                    pos.push_back(info);
+                }
+            } else {
+                const bool negative = info.loc.y < problem.source.loc.y ||
+                                      (info.loc.y == problem.source.loc.y &&
+                                       info.loc.x <= problem.source.loc.x);
+                if (negative) {
+                    neg.push_back(info);
+                } else {
+                    pos.push_back(info);
+                }
+            }
+        }
+
+        sort_group(neg);
+        sort_group(pos);
+
+        std::vector<int> neg_ids;
+        std::vector<int> pos_ids;
+        neg_ids.reserve(neg.size());
+        pos_ids.reserve(pos.size());
+        for (const ClusterRootInfo& info : neg) neg_ids.push_back(info.node_id);
+        for (const ClusterRootInfo& info : pos) pos_ids.push_back(info.node_id);
+
+        const int neg_root = build_chain_from_ordered_roots(tree, neg_ids,
+                                                            problem, problem.source.loc);
+        const int pos_root = build_chain_from_ordered_roots(tree, pos_ids,
+                                                            problem, problem.source.loc);
+        if (neg_root >= 0 && pos_root >= 0) {
+            return create_global_parent(tree, neg_root, pos_root,
+                                        problem.source.loc, problem);
+        }
+        return neg_root >= 0 ? neg_root : pos_root;
+    }
+
+    sort_group(roots);
+    std::vector<int> ordered_roots;
+    ordered_roots.reserve(roots.size());
+    for (const ClusterRootInfo& info : roots) {
+        ordered_roots.push_back(info.node_id);
+    }
+    return build_chain_from_ordered_roots(tree, ordered_roots,
+                                          problem, problem.source.loc);
 }
 
 static bool collect_subtree_sinks(int node_id,
@@ -318,13 +852,31 @@ static bool collect_subtree_sinks(int node_id,
 static bool validate_tree(const common::TopoTree& tree,
                           const common::Problem& problem,
                           std::string& err) {
-    if (tree.root < 0 || static_cast<std::size_t>(tree.root) >= tree.nodes.size()) {
-        err = "Invalid tree root";
-        return false;
-    }
-    if (tree.nodes[static_cast<std::size_t>(tree.root)].parent != -1) {
-        err = "Tree root must not have a parent";
-        return false;
+    const bool source_root_mode = tree.root == -1 && !tree.source_children.empty();
+    if (source_root_mode) {
+        for (int child : tree.source_children) {
+            if (child < 0 || static_cast<std::size_t>(child) >= tree.nodes.size()) {
+                err = "SOURCE edge references invalid child";
+                return false;
+            }
+            if (tree.nodes[static_cast<std::size_t>(child)].parent != -1) {
+                err = "SOURCE child must not have a topology parent";
+                return false;
+            }
+        }
+    } else {
+        if (tree.root < 0 || static_cast<std::size_t>(tree.root) >= tree.nodes.size()) {
+            err = "Invalid tree root";
+            return false;
+        }
+        if (!tree.source_children.empty()) {
+            err = "source_children must be empty when ROOT is a topology node";
+            return false;
+        }
+        if (tree.nodes[static_cast<std::size_t>(tree.root)].parent != -1) {
+            err = "Tree root must not have a parent";
+            return false;
+        }
     }
 
     int leaf_count = 0;
@@ -350,18 +902,35 @@ static bool validate_tree(const common::TopoTree& tree,
                 return false;
             }
             if (node.kind != common::NodeKind::Sink) {
-                err = "Sink leaf node has non-SINK kind";
+                err = "Sink leaf node has invalid kind";
                 return false;
             }
         } else {
-            const bool unary_access = node.kind == common::NodeKind::ClusterAccess &&
-                                      node.left >= 0 &&
-                                      node.right == -1;
+            const bool unary_node = node.left >= 0 && node.right == -1;
+            const bool binary_node = node.left >= 0 &&
+                                     node.right >= 0 &&
+                                     node.left != node.right;
+            const bool allow_unary =
+                unary_node &&
+                (node.kind == common::NodeKind::ClusterAccess ||
+                 node.kind == common::NodeKind::ClusterTop);
+            if (node.kind == common::NodeKind::ClusterAccess &&
+                !unary_node &&
+                !binary_node) {
+                err = "ClusterAccess must have one child or two distinct children";
+                return false;
+            }
+            if (node.kind == common::NodeKind::ClusterTop &&
+                !unary_node &&
+                !binary_node) {
+                err = "ClusterTop must have one child or two distinct children";
+                return false;
+            }
             if (node.left < 0 ||
-                (!unary_access && node.right < 0) ||
-                (!unary_access && node.left == node.right) ||
+                (!allow_unary && node.right < 0) ||
+                (!allow_unary && node.left == node.right) ||
                 static_cast<std::size_t>(node.left) >= tree.nodes.size() ||
-                (!unary_access && static_cast<std::size_t>(node.right) >= tree.nodes.size())) {
+                (!allow_unary && static_cast<std::size_t>(node.right) >= tree.nodes.size())) {
                 err = "Internal node has invalid children";
                 return false;
             }
@@ -370,11 +939,56 @@ static bool validate_tree(const common::TopoTree& tree,
                 err = "Child parent pointer mismatch";
                 return false;
             }
+            if (node.kind == common::NodeKind::ClusterAccess &&
+                left.kind == common::NodeKind::ClusterAccess) {
+                err = "ClusterAccess nodes must not be parent-child";
+                return false;
+            }
+            if (allow_unary &&
+                (node.kind == common::NodeKind::ClusterAccess ||
+                 node.kind == common::NodeKind::ClusterTop) &&
+                left.kind == common::NodeKind::ClusterInternal) {
+                err = "Canonicalized access/top node must not wrap a ClusterInternal child";
+                return false;
+            }
+            if (node.kind == common::NodeKind::ClusterTop &&
+                left.kind == common::NodeKind::Global) {
+                err = "ClusterTop must not have a Global child";
+                return false;
+            }
+            if (node.kind == common::NodeKind::ClusterBridge &&
+                node.parent >= 0) {
+                const common::TopoNode& parent =
+                    tree.nodes[static_cast<std::size_t>(node.parent)];
+                if (parent.kind != common::NodeKind::ClusterBridge &&
+                    parent.kind != common::NodeKind::ClusterTop) {
+                    err = "ClusterBridge appears outside a leaf access tree";
+                    return false;
+                }
+            }
+            if (node.kind == common::NodeKind::ClusterTop && node.parent >= 0) {
+                const common::TopoNode& parent =
+                    tree.nodes[static_cast<std::size_t>(node.parent)];
+                if (parent.kind != common::NodeKind::Global) {
+                    err = "ClusterTop parent must be Global or root";
+                    return false;
+                }
+            }
             common::BBox child_union = left.bbox;
-            if (!unary_access) {
+            if (!allow_unary) {
                 const common::TopoNode& right = tree.nodes[static_cast<std::size_t>(node.right)];
                 if (right.parent != node.id) {
                     err = "Child parent pointer mismatch";
+                    return false;
+                }
+                if (node.kind == common::NodeKind::ClusterAccess &&
+                    right.kind == common::NodeKind::ClusterAccess) {
+                    err = "ClusterAccess nodes must not be parent-child";
+                    return false;
+                }
+                if (node.kind == common::NodeKind::ClusterTop &&
+                    right.kind == common::NodeKind::Global) {
+                    err = "ClusterTop must not have a Global child";
                     return false;
                 }
                 child_union = union_bbox(left.bbox, right.bbox);
@@ -392,7 +1006,11 @@ static bool validate_tree(const common::TopoTree& tree,
             }
         }
 
-        if (node.id != tree.root) {
+        const bool is_source_child =
+            source_root_mode &&
+            std::find(tree.source_children.begin(), tree.source_children.end(),
+                      node.id) != tree.source_children.end();
+        if (node.id != tree.root && !is_source_child) {
             if (node.parent < 0 ||
                 static_cast<std::size_t>(node.parent) >= tree.nodes.size()) {
                 err = "Non-root node has invalid parent";
@@ -410,9 +1028,21 @@ static bool validate_tree(const common::TopoTree& tree,
     std::vector<int> sink_seen(problem.sinks.size(), 0);
     std::vector<int> root_sinks;
     int reachable_nodes = 0;
-    if (!collect_subtree_sinks(tree.root, tree, problem, node_state, sink_seen,
-                               reachable_nodes, root_sinks, err)) {
-        return false;
+    if (source_root_mode) {
+        for (int child : tree.source_children) {
+            std::vector<int> child_sinks;
+            if (!collect_subtree_sinks(child, tree, problem, node_state, sink_seen,
+                                       reachable_nodes, child_sinks, err)) {
+                return false;
+            }
+            root_sinks.insert(root_sinks.end(), child_sinks.begin(), child_sinks.end());
+        }
+        std::sort(root_sinks.begin(), root_sinks.end());
+    } else {
+        if (!collect_subtree_sinks(tree.root, tree, problem, node_state, sink_seen,
+                                   reachable_nodes, root_sinks, err)) {
+            return false;
+        }
     }
     if (reachable_nodes != static_cast<int>(tree.nodes.size())) {
         err = "Topology tree contains nodes unreachable from root";
@@ -436,6 +1066,7 @@ struct BuildContext {
     const common::PartitionTree& partition_tree;
     common::TopoTree& global;
     std::vector<int> partition_to_topo_root;
+    std::vector<int> cluster_roots;
 };
 
 static int build_partition_topology(BuildContext& ctx,
@@ -456,8 +1087,15 @@ static int build_partition_topology(BuildContext& ctx,
                                    std::to_string(pid) + ": " + local.error_msg;
             return -1;
         }
+        if (!is_leaf_representative(local, local.cluster_root) ||
+            local.root != local.cluster_root) {
+            ctx.global.error_msg = "Partreer did not return a ClusterTop root at partition node " +
+                                   std::to_string(pid);
+            return -1;
+        }
         const int root = append_local_tree(ctx.global, local);
         ctx.partition_to_topo_root[static_cast<std::size_t>(pid)] = root;
+        ctx.cluster_roots.push_back(root);
         if (g_debug_enabled) {
             std::cout << "[TREER] leaf partition " << pid << " sinks=";
             for (int si : pnode.sink_indices) std::cout << si << " ";
@@ -474,14 +1112,15 @@ static int build_partition_topology(BuildContext& ctx,
         child_roots.push_back(child_root);
     }
 
-    int root = merge_child_roots(child_roots, external_target, ctx.global, ctx.problem);
-    ctx.partition_to_topo_root[static_cast<std::size_t>(pid)] = root;
     if (g_debug_enabled) {
         std::cout << "[TREER] internal partition " << pid << " child_roots=";
         for (int r : child_roots) std::cout << r << " ";
-        std::cout << "root=" << root << "\n";
+        std::cout << "mapped_root=" << (child_roots.empty() ? -1 : child_roots.front())
+                  << "\n";
     }
-    return root;
+    const int mapped_root = child_roots.empty() ? -1 : child_roots.front();
+    ctx.partition_to_topo_root[static_cast<std::size_t>(pid)] = mapped_root;
+    return mapped_root;
 }
 
 }  // namespace
@@ -497,16 +1136,28 @@ void debug_output(const TopoTree& tree, const common::Problem& problem) {
     std::cout << "VALID " << (tree.valid ? 1 : 0) << "\n";
     std::cout << "ERROR_MSG " << tree.error_msg << "\n";
     std::cout << "ROOT " << tree.root << "\n";
+    std::cout << "SOURCE_CHILDREN ";
+    for (int child : tree.source_children) std::cout << child << " ";
+    std::cout << "\n";
     std::cout << "NUM_NODES " << tree.nodes.size() << "\n";
     int sinks = 0;
     int cluster_internal = 0;
     int cluster_access = 0;
+    int cluster_bridge = 0;
+    int cluster_top = 0;
     int global = 0;
+    int edge_count = tree.root >= 0 ? 1 : static_cast<int>(tree.source_children.size());
     for (const common::TopoNode& node : tree.nodes) {
         if (node.kind == common::NodeKind::Sink) ++sinks;
         if (node.kind == common::NodeKind::ClusterInternal) ++cluster_internal;
         if (node.kind == common::NodeKind::ClusterAccess) ++cluster_access;
+        if (node.kind == common::NodeKind::ClusterBridge) ++cluster_bridge;
+        if (node.kind == common::NodeKind::ClusterTop) ++cluster_top;
         if (node.kind == common::NodeKind::Global) ++global;
+        if (!node.is_sink) {
+            if (node.left >= 0) ++edge_count;
+            if (node.right >= 0) ++edge_count;
+        }
         write_node_line(std::cout, node);
         if (node.is_sink &&
             node.sink_index >= 0 &&
@@ -519,7 +1170,10 @@ void debug_output(const TopoTree& tree, const common::Problem& problem) {
     std::cout << "KIND_STATS SINK " << sinks
               << " CLUSTER_INTERNAL " << cluster_internal
               << " CLUSTER_ACCESS " << cluster_access
+              << " CLUSTER_BRIDGE " << cluster_bridge
+              << " CLUSTER_TOP " << cluster_top
               << " GLOBAL " << global << "\n";
+    std::cout << "EDGE_COUNT " << edge_count << "\n";
     std::cout << "END_TREER_DEBUG\n";
 }
 
@@ -543,14 +1197,16 @@ TopoTree build(const common::Problem& problem,
         debug_output_file(tree, problem, sample_name_or_input_path);
         return tree;
     }
-    if (!partition_tree.valid) {
-        tree.error_msg = "Cannot build topology from invalid partition tree: " +
-                         partition_tree.error_msg;
+    if (problem.sinks.empty()) {
+        tree.root = -1;
+        tree.cluster_root = -1;
+        tree.valid = true;
         debug_output_file(tree, problem, sample_name_or_input_path);
         return tree;
     }
-    if (problem.sinks.empty()) {
-        tree.error_msg = "Cannot build topology with zero sinks";
+    if (!partition_tree.valid) {
+        tree.error_msg = "Cannot build topology from invalid partition tree: " +
+                         partition_tree.error_msg;
         debug_output_file(tree, problem, sample_name_or_input_path);
         return tree;
     }
@@ -559,10 +1215,20 @@ TopoTree build(const common::Problem& problem,
     BuildContext ctx{problem,
                      partition_tree,
                      tree,
-                     std::vector<int>(partition_tree.nodes.size(), -1)};
+                     std::vector<int>(partition_tree.nodes.size(), -1),
+                     {}};
 
-    const int root = build_partition_topology(ctx, partition_tree.root, problem.source.loc);
+    const int traversal_root =
+        build_partition_topology(ctx, partition_tree.root, problem.source.loc);
+    if (traversal_root < 0) {
+        debug_output_file(tree, problem, sample_name_or_input_path);
+        return tree;
+    }
+
+    const int root =
+        build_source_aware_global_tree(tree, problem, ctx.cluster_roots);
     if (root < 0) {
+        tree.error_msg = "Failed to build source-aware global topology";
         debug_output_file(tree, problem, sample_name_or_input_path);
         return tree;
     }
@@ -583,6 +1249,9 @@ TopoTree build(const common::Problem& problem,
         for (std::size_t i = 0; i < ctx.partition_to_topo_root.size(); ++i) {
             std::cout << "  " << i << " -> " << ctx.partition_to_topo_root[i] << "\n";
         }
+        std::cout << "[TREER] cluster_roots ";
+        for (int cluster_root : ctx.cluster_roots) std::cout << cluster_root << " ";
+        std::cout << "\n";
         debug_output(tree, problem);
     }
     debug_output_file(tree, problem, sample_name_or_input_path);
