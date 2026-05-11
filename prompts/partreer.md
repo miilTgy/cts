@@ -51,6 +51,8 @@ struct TopoNode {
         Sink,
         ClusterInternal,
         ClusterAccess,
+        ClusterBridge,
+        ClusterTop,
         Global
     } kind = NodeKind::ClusterInternal;
 };
@@ -62,7 +64,7 @@ struct TopoNode {
 - `subtree_*_to_node` 表示当前 node 覆盖的所有 sinks 到当前 node 的 delay range / skew。
 - leaf sink node 的 `subtree_min_delay_to_node = subtree_max_delay_to_node = subtree_skew_to_node = 0`。
 - internal node 的 delay 由 child subtree delay 加上当前 node 到 child node 的 Manhattan distance 得到。
-- `kind` 标记 node 分类：`Sink` 表示 sink leaf；`ClusterInternal` 表示 cluster 内部 pairing 生成的 internal tapping node；`ClusterAccess` 表示 cluster 对外接入树上的 node，包括最终 `cluster_root`；`Global` 只由 treer 在跨 partition 的 global merge 中生成，partreer 不生成 `Global` node。
+- `kind` 分类：`Sink` 是 sink leaf；`ClusterInternal` 是 cluster 内部 pairing/tapping node；`ClusterAccess` 是真实 access tap；`ClusterBridge` 是 access taps 的二叉 merge node；`ClusterTop` 是对 treer 暴露的唯一 `cluster_root`；`Global` 只由 treer 生成。
 
 对 internal node `v`：
 
@@ -84,7 +86,7 @@ subtree_skew_to_node      = subtree_max_delay_to_node - subtree_min_delay_to_nod
 
 ## Local Topology 总策略
 
-每个 cluster 对外只返回一个 `cluster_root`，但内部可以先形成多个 access sub-roots。
+每个 cluster 对外只返回一个 `ClusterTop cluster_root`，内部可先形成多个 access sub-roots。
 
 使用 Pair-first Access Tree：
 
@@ -94,8 +96,8 @@ subtree_skew_to_node      = subtree_max_delay_to_node - subtree_min_delay_to_nod
 4. 每个 selected pair 生成一个 internal tapping node，`kind = ClusterInternal`，并连接为 binary parent。
 5. 未匹配 node 直接 carry 到下一 level。
 6. 当 active node 数量 `<= target_access_points`，或当前 level 找不到合法 pair 时，停止 pairing。
-7. 剩余 active nodes 作为 access sub-roots。
-8. 用简单 balanced binary tree 将 access sub-roots 汇聚到一个 `cluster_root`。
+7. 剩余 active nodes 作为真实 access sub-roots，必要时标为 `ClusterAccess`。
+8. access 数量为 1 时直接把该 access root 改为 `ClusterTop`，不新增一元 parent；为 2 时 `ClusterTop` 直接连两个 access；大于 2 时才用 `ClusterBridge` 合并后接到 `ClusterTop`。
 
 建议常量：
 
@@ -225,15 +227,19 @@ parent node 必须更新：
 
 ## Access Tree 构造
 
-pairing 结束后，剩余 active nodes 是 access sub-roots。
+pairing 结束后的 active nodes 是 access sub-roots。构造规则：
 
-- active size = 1：额外创建一个 `ClusterAccess` wrapper root 连接该 node，作为 `cluster_root`。
-- active size = 2：创建一个 `ClusterAccess` parent node 连接二者，作为 `cluster_root`。
-- active size >= 3：按相对 `external_target` 的方向排序，递归构造 balanced binary tree，所有新建 parent nodes 均为 `ClusterAccess`，最终得到一个 `cluster_root`。
+- 若 active node 还不是真实 access tap，可按需要新建/标记 `ClusterAccess` wrapper。
+- active size = 1：直接把该 access root 改为 `ClusterTop`，作为 `cluster_root`，不新增一元 parent。
+- active size = 2：创建 `ClusterTop` 直接连接两个 `ClusterAccess`。
+- active size > 2：用 balanced binary tree 合并；中间 parent 全部为 `ClusterBridge`，最顶层再创建 `ClusterTop`。
+- 禁止 `ClusterAccess -> ClusterAccess`。`ClusterAccess` 只表示真实 tap，不承担 merge 语义。
+- access tree 完成后执行 canonicalize：反复处理仅有 1 个 child 的 node。若 parent/child 在偏序中可比较，则较大者吸收较小者；partreer 内使用 `ClusterTop > ClusterBridge > ClusterAccess > ClusterInternal`，且 `Sink > ClusterAccess`、`Sink > ClusterInternal`。吸收时保留较大者 `kind/loc`，接管较小者 child；若较大者是 child，则用 child 替换 parent 接到 grandparent。不可比较 pair 不强行吸收，只在 debug 标出。
+- 若 `ClusterAccess` 只有一个 `ClusterInternal` child，则吞并该 child：`ClusterAccess` 保持坐标/kind，接管 child 的 `left/right` 并更新 grandchildren 的 `parent`。
 
-构造 access tree 时仍然必须遵守 CONNECTABLE 的 segment 相交检查。如果直接连接会非法，允许调整 parent tapping node 坐标，或改变 active nodes 的 pairing 顺序。
+构造 access tree 仍必须遵守 CONNECTABLE 检查。若直接连接非法，允许调整 parent tapping node 坐标或改变 pairing 顺序。
 
-最终返回的 `cluster_root` 必须是 `ClusterAccess`。
+最终返回的 `cluster_root.kind` 必须是 `ClusterTop`。
 
 ## Debug 输出要求
 
@@ -252,7 +258,8 @@ Debug 开启时输出：
 - 被 carry 的 nodes；
 - 每个 internal node 的 left/right skew 和 subtree skew；
 - node kind 分类统计；
-- 最终 `cluster_root`。
+- canonicalize 吸收记录和剩余不可比较的一元关系；
+- 最终 `ClusterTop cluster_root`。
 
 Debug 关闭时不打印 log。
 
