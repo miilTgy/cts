@@ -523,15 +523,15 @@ static int buffer_cost(const common::Problem& problem,
 
 static std::vector<common::BufferChoice> buffer_options(
     const common::Problem& problem,
-    const common::TopoNode& child) {
+    const common::ClusterDmeNode& child) {
     std::vector<common::BufferChoice> options;
     options.push_back(common::BufferChoice{});
-    if (child.is_sink) {
+    if (child.node_class == common::DmeNodeClass::Sink) {
         return options;
     }
     for (std::size_t i = 0; i < problem.buffer_types.size(); ++i) {
         const common::BufferType& buf = problem.buffer_types[i];
-        if (buf.max_fanout >= static_cast<int>(child.sink_indices.size())) {
+        if (buf.max_fanout >= child.sink_count) {
             common::BufferChoice choice;
             choice.has_buffer = true;
             choice.buffer_type_index = static_cast<int>(i);
@@ -576,10 +576,10 @@ static bool validate_node_result(const common::BottomUpNodeResult& node,
 
 static bool solve_leaf(int node_id,
                        const common::Problem& problem,
-                       const common::TopoTree& tree,
+                       const common::ClusterDmeInput& input,
                        common::BottomUpResult& result,
                        std::string& err) {
-    const common::TopoNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
+    const common::ClusterDmeNode& node = input.nodes[static_cast<std::size_t>(node_id)];
     if (node.sink_index < 0 ||
         static_cast<std::size_t>(node.sink_index) >= problem.sinks.size()) {
         err = "Leaf node has invalid sink index";
@@ -588,7 +588,9 @@ static bool solve_leaf(int node_id,
     const common::Sink& sink = problem.sinks[static_cast<std::size_t>(node.sink_index)];
 
     common::BottomUpNodeResult out;
-    out.node_id = node_id;
+    out.node_id = node.origin_node_id;
+    out.local_id = node_id;
+    out.origin_node_id = node.origin_node_id;
     out.valid = true;
     out.ms = point_segment(sink.loc.x, sink.loc.y);
     out.extraction_mode = "LEAF";
@@ -598,15 +600,15 @@ static bool solve_leaf(int node_id,
 
 static bool solve_internal(int node_id,
                            const common::Problem& problem,
-                           const common::TopoTree& tree,
+                           const common::ClusterDmeInput& input,
                            common::BottomUpResult& result,
                            std::string& err) {
-    const common::TopoNode& node = tree.nodes[static_cast<std::size_t>(node_id)];
+    const common::ClusterDmeNode& node = input.nodes[static_cast<std::size_t>(node_id)];
     const int left_id = node.left;
     const int right_id = node.right;
     if (left_id < 0 || right_id < 0 || left_id == right_id ||
-        static_cast<std::size_t>(left_id) >= tree.nodes.size() ||
-        static_cast<std::size_t>(right_id) >= tree.nodes.size()) {
+        static_cast<std::size_t>(left_id) >= input.nodes.size() ||
+        static_cast<std::size_t>(right_id) >= input.nodes.size()) {
         err = "Internal node has invalid children";
         return false;
     }
@@ -621,9 +623,9 @@ static bool solve_internal(int node_id,
     }
 
     const std::vector<common::BufferChoice> left_options =
-        buffer_options(problem, tree.nodes[static_cast<std::size_t>(left_id)]);
+        buffer_options(problem, input.nodes[static_cast<std::size_t>(left_id)]);
     const std::vector<common::BufferChoice> right_options =
-        buffer_options(problem, tree.nodes[static_cast<std::size_t>(right_id)]);
+        buffer_options(problem, input.nodes[static_cast<std::size_t>(right_id)]);
 
     double best_total_cost = INF;
     common::BottomUpNodeResult best;
@@ -660,7 +662,9 @@ static bool solve_internal(int node_id,
             const double r_max = right.max_delay + edge_to_right + r_buf_delay;
 
             common::BottomUpNodeResult candidate;
-            candidate.node_id = node_id;
+            candidate.node_id = node.origin_node_id;
+            candidate.local_id = node_id;
+            candidate.origin_node_id = node.origin_node_id;
             candidate.valid = true;
             candidate.ms = candidate_ms;
             candidate.edge_to_left = edge_to_left;
@@ -707,12 +711,12 @@ static bool solve_internal(int node_id,
 
 static bool solve_node(int node_id,
                        const common::Problem& problem,
-                       const common::TopoTree& tree,
+                       const common::ClusterDmeInput& input,
                        common::BottomUpResult& result,
                        std::vector<int>& state,
                        std::string& err) {
-    if (node_id < 0 || static_cast<std::size_t>(node_id) >= tree.nodes.size()) {
-        err = "Tree node id out of range";
+    if (node_id < 0 || static_cast<std::size_t>(node_id) >= input.nodes.size()) {
+        err = "Cluster DME node id out of range";
         return false;
     }
     const std::size_t idx = static_cast<std::size_t>(node_id);
@@ -725,20 +729,20 @@ static bool solve_node(int node_id,
     }
 
     state[idx] = 1;
-    const common::TopoNode& node = tree.nodes[idx];
+    const common::ClusterDmeNode& node = input.nodes[idx];
     bool ok = false;
-    if (node.is_sink) {
-        ok = solve_leaf(node_id, problem, tree, result, err);
+    if (node.node_class == common::DmeNodeClass::Sink) {
+        ok = solve_leaf(node_id, problem, input, result, err);
     } else {
         if (node.left < 0 || node.right < 0 || node.left == node.right ||
-            static_cast<std::size_t>(node.left) >= tree.nodes.size() ||
-            static_cast<std::size_t>(node.right) >= tree.nodes.size()) {
+            static_cast<std::size_t>(node.left) >= input.nodes.size() ||
+            static_cast<std::size_t>(node.right) >= input.nodes.size()) {
             err = "Internal node has invalid children";
             return false;
         }
-        ok = solve_node(node.left, problem, tree, result, state, err) &&
-             solve_node(node.right, problem, tree, result, state, err) &&
-             solve_internal(node_id, problem, tree, result, err);
+        ok = solve_node(node.left, problem, input, result, state, err) &&
+             solve_node(node.right, problem, input, result, state, err) &&
+             solve_internal(node_id, problem, input, result, err);
     }
     if (!ok) {
         return false;
@@ -765,6 +769,18 @@ static std::string buffer_choice_to_string(const common::BufferChoice& choice,
     return oss.str();
 }
 
+static const char* dme_class_to_string(common::DmeNodeClass node_class) {
+    switch (node_class) {
+        case common::DmeNodeClass::Sink:
+            return "SINK";
+        case common::DmeNodeClass::Internal:
+            return "INTERNAL";
+        case common::DmeNodeClass::Access:
+            return "ACCESS";
+    }
+    return "UNKNOWN";
+}
+
 }  // namespace
 
 void debug_enable(bool enable) {
@@ -773,29 +789,32 @@ void debug_enable(bool enable) {
 
 void debug_output(const BottomUpResult& result,
                   const common::Problem& problem,
-                  const common::TopoTree& tree) {
+                  const ClusterDmeInput& input) {
     if (!g_debug_enabled) {
         return;
     }
 
     std::cout << "[BU] valid=" << (result.valid ? 1 : 0)
               << " error_msg=" << result.error_msg
-              << " root=" << result.root
+              << " cluster_id=" << result.cluster_id
+              << " root_local_id=" << result.root_local_id
+              << " root_origin_node_id=" << result.root_origin_node_id
               << " num_node_results=" << result.node_results.size() << "\n";
     for (std::size_t i = 0; i < result.node_results.size(); ++i) {
         const common::BottomUpNodeResult& node_result = result.node_results[i];
-        if (i >= tree.nodes.size()) {
+        if (i >= input.nodes.size()) {
             continue;
         }
-        const common::TopoNode& node = tree.nodes[i];
-        std::cout << "[BU] node_id=" << node.id
+        const common::ClusterDmeNode& node = input.nodes[i];
+        std::cout << "[BU] local_id=" << node.local_id
+                  << " origin_node_id=" << node.origin_node_id
+                  << " class=" << dme_class_to_string(node.node_class)
                   << " parent=" << node.parent
                   << " left=" << node.left
                   << " right=" << node.right
-                  << " is_leaf=" << (node.is_sink ? 1 : 0)
                   << " sink_index=" << node.sink_index
-                  << " sink_count=" << node.sink_indices.size() << "\n";
-        if (node.is_sink &&
+                  << " sink_count=" << node.sink_count << "\n";
+        if (node.node_class == common::DmeNodeClass::Sink &&
             node.sink_index >= 0 &&
             static_cast<std::size_t>(node.sink_index) < problem.sinks.size()) {
             const common::Sink& sink =
@@ -827,44 +846,79 @@ void debug_output(const BottomUpResult& result,
 }
 
 BottomUpResult run(const common::Problem& problem,
-                   const common::TopoTree& tree) {
+                   const ClusterDmeInput& input) {
     BottomUpResult result;
     if (!problem.valid) {
         result.error_msg = "Cannot run BU on invalid problem: " + problem.error_msg;
         return result;
     }
-    if (!tree.valid) {
-        result.error_msg = "Cannot run BU on invalid tree: " + tree.error_msg;
+    if (!input.valid) {
+        result.error_msg = "Cannot run BU on invalid cluster DME input: " + input.error_msg;
         return result;
     }
-    if (tree.nodes.empty()) {
-        result.error_msg = "Cannot run BU on empty tree";
+    if (input.nodes.empty()) {
+        result.error_msg = "Cannot run BU on empty cluster DME input";
         return result;
     }
-    if (tree.root < 0 || static_cast<std::size_t>(tree.root) >= tree.nodes.size()) {
-        result.error_msg = "Invalid tree root";
+    if (input.root_local_id < 0 ||
+        static_cast<std::size_t>(input.root_local_id) >= input.nodes.size()) {
+        result.error_msg = "Invalid cluster DME root";
+        return result;
+    }
+    if (input.nodes[static_cast<std::size_t>(input.root_local_id)].node_class !=
+        common::DmeNodeClass::Access) {
+        result.error_msg = "Cluster DME root must be an access node";
         return result;
     }
 
-    result.node_results.resize(tree.nodes.size());
-    std::vector<int> state(tree.nodes.size(), 0);
+    result.cluster_id = input.cluster_id;
+    result.root_local_id = input.root_local_id;
+    result.root_origin_node_id = input.root_origin_node_id;
+    result.root = input.root_local_id;
+    result.node_results.resize(input.nodes.size());
+    result.local_to_origin_node_id.resize(input.nodes.size(), -1);
+    for (std::size_t i = 0; i < input.nodes.size(); ++i) {
+        const common::ClusterDmeNode& node = input.nodes[i];
+        if (node.local_id != static_cast<int>(i)) {
+            result.error_msg = "Cluster DME local_id does not match vector index";
+            return result;
+        }
+        if (node.origin_node_id < 0) {
+            result.error_msg = "Cluster DME node has invalid origin_node_id";
+            return result;
+        }
+        if (node.node_class == common::DmeNodeClass::Sink) {
+            if (node.sink_index < 0 ||
+                static_cast<std::size_t>(node.sink_index) >= problem.sinks.size()) {
+                result.error_msg = "Cluster DME sink node has invalid sink index";
+                return result;
+            }
+        } else if (node.left < 0 || node.right < 0 || node.left == node.right ||
+                   static_cast<std::size_t>(node.left) >= input.nodes.size() ||
+                   static_cast<std::size_t>(node.right) >= input.nodes.size()) {
+            result.error_msg = "Cluster DME internal/access node has invalid children";
+            return result;
+        }
+        result.local_to_origin_node_id[i] = node.origin_node_id;
+    }
+
+    std::vector<int> state(input.nodes.size(), 0);
     std::string err;
-    if (!solve_node(tree.root, problem, tree, result, state, err)) {
+    if (!solve_node(input.root_local_id, problem, input, result, state, err)) {
         result.valid = false;
         result.error_msg = err;
         return result;
     }
     const common::BottomUpNodeResult& root_result =
-        result.node_results[static_cast<std::size_t>(tree.root)];
+        result.node_results[static_cast<std::size_t>(input.root_local_id)];
     if (!root_result.valid) {
         result.error_msg = "Root BU result is invalid";
         return result;
     }
 
-    result.root = tree.root;
     result.valid = true;
     if (g_debug_enabled) {
-        debug_output(result, problem, tree);
+        debug_output(result, problem, input);
     }
     return result;
 }
