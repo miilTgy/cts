@@ -27,6 +27,10 @@
 - polyline 起点必须是 parent loc，终点必须是 child loc。
 - 中间点只能作为水平/垂直折线的 turning points。
 - 不允许改变 locer 给出的 node loc。
+- Router input locs 必须已经是整数 grid 坐标；router 不负责替 locer 做 snap。
+- Router 最终 route/debug polyline 必须只包含整数 grid 坐标。
+- Router 必须使用 scale=1 的整数 grid routing；如果 locer 给出非整数坐标，router 应直接返回明确错误，而不是自动切换到 half-grid / fractional scale。
+- Pattern route 和 maze route 的内部状态、candidate endpoint、commit 后的 `RouterEdgeDebug::polyline` 都不得产生 fractional point。
 
 
 source 可以作为虚拟 endpoint 使用 problem source loc，不要求它一定存在于 topology nodes 中。

@@ -8,6 +8,18 @@
 
 ---
 
+# 0.5 整数坐标契约
+
+最终写入 `common::LocerNodeResult::loc` 的坐标必须是整数 grid 坐标。
+
+- Locer 内部可以继续使用 floating point 做 DME、candidate generation、scoring、delay/profile 估计。
+- 在 commit 每个最终 locer output 之前，所有非 sink node 必须 snap 到最近整数 grid point，并 clamp 到 die 范围内。
+- Sink node 必须保持 input sink 的精确整数坐标，不允许被 DME midpoint 或 snap 改动。
+- Final validation 必须拒绝任何非整数 `result.node_results[*].loc`。
+- 这个整数化是 locer 的输出边界规范，不应改变 topology、不应改变候选评分公式、不应改 route/writer 逻辑。
+
+---
+
 # 1. 输入输出
 
 输入：

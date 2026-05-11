@@ -177,47 +177,34 @@ static PointKey to_key(const ScaledPoint& p) {
     return PointKey{p.x, p.y};
 }
 
-static bool nearly_scaled(double v, int scale) {
-    return std::abs(v * scale - std::round(v * scale)) <= 10.0 * EPS;
+static bool is_near_integer(double v) {
+    return std::abs(v - std::round(v)) <= 1e-6;
 }
 
-static int choose_scale(const common::Problem& problem,
-                        const common::TopoTree& tree,
-                        const common::LocerResult& loc_result) {
-    const std::array<int, 4> scales{{1, 2, 4, 8}};
-    auto fits = [&](int scale) {
-        if (!nearly_scaled(problem.source.loc.x, scale) ||
-            !nearly_scaled(problem.source.loc.y, scale)) {
+static bool validate_integer_locs(const common::TopoTree& tree,
+                                  const common::LocerResult& loc_result,
+                                  std::string& err) {
+    if (loc_result.node_results.size() != tree.nodes.size()) {
+        err = "Router requires locer node count to match topology";
+        return false;
+    }
+    for (std::size_t i = 0; i < loc_result.node_results.size(); ++i) {
+        const common::LocerNodeResult& node = loc_result.node_results[i];
+        if (!node.valid) {
+            err = "Router requires valid locer result at node " + std::to_string(i);
             return false;
         }
-        for (const common::Sink& sink : problem.sinks) {
-            if (!nearly_scaled(sink.loc.x, scale) ||
-                !nearly_scaled(sink.loc.y, scale)) {
-                return false;
-            }
-        }
-        if (loc_result.node_results.size() != tree.nodes.size()) {
+        if (!std::isfinite(node.loc.x) || !std::isfinite(node.loc.y)) {
+            err = "Router requires finite locer coordinate at node " + std::to_string(i);
             return false;
         }
-        for (std::size_t i = 0; i < loc_result.node_results.size(); ++i) {
-            const common::LocerNodeResult& node = loc_result.node_results[i];
-            if (!node.valid) {
-                return false;
-            }
-            if (!nearly_scaled(node.loc.x, scale) ||
-                !nearly_scaled(node.loc.y, scale)) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    for (int scale : scales) {
-        if (fits(scale)) {
-            return scale;
+        if (!is_near_integer(node.loc.x) || !is_near_integer(node.loc.y)) {
+            err = "Router requires integer locer coordinate at node " +
+                  std::to_string(i);
+            return false;
         }
     }
-    return 8;
+    return true;
 }
 
 static ScaledPoint scale_point(const common::SegmentPoint& p, int scale) {
@@ -2144,7 +2131,13 @@ RouterResult run(const common::Problem& problem,
         return result;
     }
 
-    const int scale = choose_scale(problem, tree, loc_result);
+    std::string integer_loc_error;
+    if (!validate_integer_locs(tree, loc_result, integer_loc_error)) {
+        result.error_msg = integer_loc_error;
+        return result;
+    }
+
+    const int scale = 1;
     std::string build_error;
     std::vector<EdgeInfo> edges = build_edges(problem, tree, loc_result, scale, build_error);
     if (!build_error.empty()) {

@@ -130,6 +130,14 @@ static bool finite_point(const common::SegmentPoint& p) {
            std::abs(p.x) < INF / 2.0 && std::abs(p.y) < INF / 2.0;
 }
 
+static bool is_near_integer(double v) {
+    return std::abs(v - std::round(v)) <= 1e-6;
+}
+
+static bool is_integer_point(const common::SegmentPoint& p) {
+    return is_near_integer(p.x) && is_near_integer(p.y);
+}
+
 static std::string primary_axis_to_string(PrimaryAxis axis) {
     return axis == PrimaryAxis::X ? "X" : "Y";
 }
@@ -231,6 +239,13 @@ static common::SegmentPoint clamp_to_grid(common::SegmentPoint p,
     p.x = std::max(0.0, std::min(static_cast<double>(problem.die_width), p.x));
     p.y = std::max(0.0, std::min(static_cast<double>(problem.die_height), p.y));
     return p;
+}
+
+static common::SegmentPoint snap_to_integer_grid(common::SegmentPoint p,
+                                                 const common::Problem& problem) {
+    p.x = std::round(p.x);
+    p.y = std::round(p.y);
+    return clamp_to_grid(p, problem);
 }
 
 static std::string node_class_string(common::NodeKind kind) {
@@ -1172,7 +1187,7 @@ static void write_dme_results(common::LocerResult& loc_result,
             loc_result.node_results[static_cast<std::size_t>(node_id)];
         out.node_id = node_id;
         out.valid = true;
-        out.loc = td_node.loc;
+        out.loc = snap_to_integer_grid(td_node.loc, problem);
         out.node_class = node_class_string(topo.kind);
         out.cluster_id = input.cluster_id;
         if (local_node.node_class == common::DmeNodeClass::Access) {
@@ -1629,7 +1644,7 @@ static bool place_outer_node(common::LocerResult& result,
             result.node_results[static_cast<std::size_t>(node_id)];
         out.node_id = node_id;
         out.valid = true;
-        out.loc = clamp_to_grid(best, problem);
+        out.loc = snap_to_integer_grid(best, problem);
         out.node_class = node_class_string(node.kind);
         out.cluster_id = covered_clusters.size() == 1 ? covered_clusters.front() : -1;
         out.loc_mode = loc_mode + fallback_suffix;
@@ -1994,7 +2009,7 @@ static bool assign_dme_fallback_node(common::LocerResult& result,
         stats_from_delays(out);
         return true;
     }
-    out.loc = to_segment_point(node.loc);
+    out.loc = snap_to_integer_grid(to_segment_point(node.loc), problem);
     out.loc_mode = "DME_TOPOLOGY_FALLBACK";
     update_profile_from_children(result, tree, node_id, false, nullptr, nullptr);
     return true;
@@ -2132,6 +2147,11 @@ static bool validate_final_result(const common::Problem& problem,
         }
         if (!in_grid(out.loc, problem)) {
             err = "Locer node loc out of die at node " + std::to_string(i);
+            return false;
+        }
+        if (!is_integer_point(out.loc)) {
+            err = "Locer node loc is not integer grid coordinate at node " +
+                  std::to_string(i);
             return false;
         }
         if (out.sink_delays_to_node.empty()) {
