@@ -469,13 +469,29 @@ Objective skew is computed at the source virtual root: if the source has multipl
 
 ---
 
-## 10. Unimplemented Features (TODO)
+## 10. Results
+
+Solution visualizations for all five samples. Blue lines are routed polylines (including detours); green squares are buffer insertions; red circles are sinks; the yellow star is the source.
+
+![Sample 0](result/fig/sample0_solution.png)
+
+![Sample 1](result/fig/sample1_solution.png)
+
+![Sample 2](result/fig/sample2_solution.png)
+
+![Sample 3](result/fig/sample3_solution.png)
+
+![Sample 4](result/fig/sample4_solution.png)
+
+---
+
+## 11. Unimplemented Features (TODO)
 
 1. **2D global distribution**: the current global placement is an order-constrained 1D chain; a more complete 2D global distribution remains to be considered. Buffer insertion is already complete (see Section 8).
 
 ---
 
-## 11. Key Geometric / Data Architecture Decisions
+## 12. Key Geometric / Data Architecture Decisions
 
 - **All DME geometry uses rotated coordinates (u, v)**: `u = x + y`, `v = x - y`. Manhattan distance = `max(Δu, Δv)`. TRRs are axis-aligned rectangles in (u, v).
 - **Global integer coordinates**: the locer snaps to integer grid before output; the router uses scale=1 integer-grid routing.
