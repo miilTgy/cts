@@ -284,11 +284,15 @@ Given the fixed coordinates determined by the locer, generate legal Manhattan po
 | `ExternalAccessPatternThenMaze` | access↔bridge↔top | pattern-first, A* maze fallback |
 | `GlobalPatternThenMaze` | global↔global↔top↔source | pattern-first, A* maze fallback |
 
-**6.2 Two-Stage Bottom-Up Route Order**
+**6.2 Hybrid Route Order: Cluster Bottom-Up + Global Top-Down**
 
-Stage A (per-cluster): first route the edges sink→internal→access within each cluster, then route the access/bridge/top edges of that cluster until the top is connected. Process in order of cluster-internal depth; shorter edges closer to sinks go first.
+The route order is a two-stage hybrid strategy that decouples the cluster domain from the global domain:
 
-Stage B (global): after all cluster tops are connected, route the global trunk from each top toward the source. Edges closer to the source go last.
+Stage A (per-cluster bottom-up): within each cluster, sink→internal→access edges are routed first (LocalClusterPatternOnly), then access/bridge/top edges of that cluster (ExternalAccessPatternThenMaze) until the cluster top is connected. Shorter edges near sinks go first; each cluster completes its entire subtree before the next cluster begins. This bottom-up approach ensures short local edges don't get blocked by long global trunks.
+
+Stage B (global top-down): after all cluster tops are connected, the global trunk is routed. When source has only 1 child (degenerate non-binary case, e.g., source→single Global node), the source→child edge is routed FIRST among GlobalPatternThenMaze edges — this pre-reserves the source port on the child node, preventing downstream global→top edges from occupying the only space the source needs to connect. When source has multiple children (proper binary tree), the original bottom-up order applies (edges farther from source first, source-adjacent last).
+
+The key insight: the cluster domain and global domain are spatially disjoint during routing. Cluster-internal routes occupy leaf-side space; global routes occupy center-side space. The only vulnerable point is the source→global degenerate edge, which the single-child-first rule protects.
 
 **6.3 Directional Port / Pin Access**
 
