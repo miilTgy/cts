@@ -464,7 +464,7 @@ static bool is_leaf_representative(const common::TopoTree& tree, int node_id) {
                common::NodeKind::ClusterTop;
 }
 
-[[maybe_unused]] static void absorb_source_root_if_global(common::TopoTree& tree, int root) {
+static void absorb_source_root_if_global(common::TopoTree& tree, int root) {
     tree.source_children.clear();
     if (root < 0 ||
         static_cast<std::size_t>(root) >= tree.nodes.size() ||
@@ -1233,9 +1233,13 @@ TopoTree build(const common::Problem& problem,
         return tree;
     }
 
-    tree.root = root;
-    tree.cluster_root = root;
-    tree.nodes[static_cast<std::size_t>(root)].parent = -1;
+    // absorb_source_root_if_global(tree, root);
+
+    if (tree.source_children.empty()) {
+        tree.root = root;
+        tree.cluster_root = root;
+        tree.nodes[static_cast<std::size_t>(root)].parent = -1;
+    }
     tree.valid = true;
 
     std::string err;
