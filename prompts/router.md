@@ -505,60 +505,43 @@ Pattern candidate 与 maze candidate 都必须走同一个 `check_legality()`，
 
 ## 8. Route Order
 
-router 必须采用 two-stage bottom-up route order。这是硬要求，不是建议。
+router 必须采用 two-stage route order。核心是 **cluster 域 bottom-up + global 域 top-down** 的混合策略。
 
 核心原则：
 
-1. 先对每个 physical cluster 内部单独 bottom-up route，一直 route 到该 cluster 的 top。
-2. in-cluster route 包含两部分：
-   - cluster local DME edges：sink/internal/access；
-   - cluster access-to-top edges：access/bridge/top。
-3. `access -> bridge -> top` 或 `access -> top` 这部分仍属于该 cluster 的 in-cluster routing stage，应在切换到 global/source 之前完成。
-4. 所有 cluster 都 route 到 top 之后，再 route global/source 主干。
-5. global/source 主干也必须 bottom-up，从各个 cluster top 往 global 汇合，最后 route 到 source。
+1. Stage A（per-cluster bottom-up）：先对每个 physical cluster 内部单独 bottom-up route，一直 route 到该 cluster 的 top。包含 LocalClusterPatternOnly 和 ExternalAccessPatternThenMaze。
+2. Stage B（global route to source）：所有 cluster 到 top 后，再 route global/source 主干。global 域采用 **top-down** 顺序：source→global edge 最先路由（确保 source 端口预留不被下游抢占），global→top edges 随后路由。
 
 不要采用 global-first。不要先 route source/global/top 主干再回头 route cluster 内部短线。否则主干线会提前占用局部通道，导致本应简单成功的 sink-internal route failed。
 
-### 8.1 Stage A：per-cluster in-cluster bottom-up routing to top
-
-对每个 physical cluster / ClusterTop，单独收集该 cluster 内部需要 route 到 top 的 edges。
-
-第一类是 LocalClusterPatternOnly edges：
-
-- Sink <-> ClusterInternal
-- ClusterInternal <-> ClusterInternal
-- ClusterInternal <-> ClusterAccess
-- ClusterAccess <-> ClusterAccess，如果存在
-
-第二类是该 cluster 自己的 access-to-top edges，使用 ExternalAccessPatternThenMaze policy：
-
-- ClusterAccess <-> ClusterBridge
-- ClusterAccess <-> ClusterTop
-- ClusterBridge <-> ClusterTop
-
-注意：这些 access/bridge/top 边虽然使用 ExternalAccessPatternThenMaze policy，但在 route order 上仍属于当前 cluster 的 Stage A。也就是说，一个 cluster 内部必须先从 sink/internal/access bottom-up route 到 access，再继续 route access/bridge/top，直到该 cluster top 被接通。
-
-也就是说，对 cluster 内部 DME tree，优先 route 靠近 sink 的短边，再逐层向 access/root 汇合；随后立即 route 该 cluster 的 access/bridge/top，使该 cluster 在 Stage A 结束时已经完整接到 top。
-
-推荐 local edge sort key：
+route order 在实现上通过 `build_edges()` 的 `std::stable_sort` 完成，基于以下 sort key：
 
 ```text
-cluster_id first
-within each cluster:
-  policy_priority:
-    LocalClusterPatternOnly        = 0
-    ExternalAccessPatternThenMaze  = 1   // only this cluster's access/bridge/top edges
-  for LocalClusterPatternOnly:
-    smaller subtree_depth_from_sink first
-    or larger distance_to_access/root later
-    or simply leaf/sink-adjacent edges first
-  for this cluster's ExternalAccessPatternThenMaze:
-    access-side edge first
-    bridge-to-top later
-    shorter Manhattan distance first
-    avoid consuming ClusterTop's global-facing port before Stage B
-    avoid consuming ClusterTop's bridge-facing port before bridge-to-top edge
-  then lower edge_id for deterministic order
+Stage A（非 GlobalPatternThenMaze）先于 Stage B（GlobalPatternThenMaze）：
+  non-GlobalPatternThenMaze edges go first
+
+Stage A 内部排序：
+  cluster_id first
+  within each cluster:
+    policy_priority:
+      LocalClusterPatternOnly        = 0
+      ExternalAccessPatternThenMaze  = 1   // only this cluster's access/bridge/top edges
+    for LocalClusterPatternOnly:
+      larger cluster_depth first (sink→internal→access bottom-up)
+      shorter Manhattan distance first (short edges near sinks first)
+    for this cluster's ExternalAccessPatternThenMaze:
+      larger cluster_depth first
+      shorter Manhattan distance first
+    then lower edge_id for determinism
+
+Stage B 内部排序：
+  若 source 仅有 1 个 child（非二叉树情况，source→单个 global/top）：
+    source→child edge 最优先路由（确保 source 端口预留，防止下游 global→top edges 抢占其必经空间）
+  否则（source 有多个 child，二叉树）：
+    按 source_depth 降序（远离 source 的 edge 先路由）
+    source-adjacent edges 最后路由
+  同深度内按 Manhattan distance 升序
+  最后按 parent_id, child_id 保证确定性
 ```
 
 注意：Stage A 是"每个 cluster 内部一直 route 到 top"，不是只 route 到 access，也不是把所有 sink-adjacent edges 混在一起后再 route 所有 internal edges。推荐流程是：
@@ -570,49 +553,6 @@ for each cluster in deterministic cluster_id order:
 ```
 
 这样每个 cluster 内部的短线和接入 top 的线都可以先完成，避免后续 global/source route 影响 cluster 内部可行性。
-
-access/bridge/top 的 route 策略仍然是 pattern-first：先尝试 I-shape、L-shape、Z-shape；如果失败，可以 fallback 到 A* maze routing with bend penalty。maze fallback 只用于该 cluster 的 access/bridge/top 接入，不要用于 sink/internal 局部短线的全局乱绕。
-
-### 8.2 Stage B：global bottom-up routing to source
-
-当所有 cluster 都已经在 Stage A 中 route 到各自 top 后，再 route 全局边。
-
-Stage B 只处理跨 cluster 的 global/source 主干，不再处理 access/bridge/top。access/bridge/top 已经在各自 cluster 的 Stage A 中完成。
-
-GlobalPatternThenMaze edges 的顺序必须从 cluster/top 侧向 source 汇合：
-
-- ClusterTop <-> Global
-- Global <-> Global
-- Source <-> Global
-- Source <-> ClusterTop
-
-应先 route farther_from_source 的 global/top 边，source-adjacent edge 最后 route。
-
-`Source <-> ClusterTop` 仅在 topology 中 source 直接连接 ClusterTop 时适用；一般情况是 `ClusterTop -> Global -> ... -> Source`。
-
-如果 `tree.source_children` 为空，Stage B 必须把 `Source -> tree.root` 当作最后一条 source-adjacent edge。不要因为 source 不在 topology nodes 中就跳过 source/root route。
-
-推荐 global edge sort key：
-
-```text
-policy_priority:
-  GlobalPatternThenMaze = 2
-
-within GlobalPatternThenMaze:
-  larger topology_depth_from_source first
-  source-adjacent edge last
-  shorter Manhattan distance first within same depth
-  then lower edge_id
-```
-
-如果实现里已有 `sort_edges_by_route_order()`，必须改为 `sort_edges_by_two_stage_bottom_up_route_order()` 或等价逻辑，并确保：
-
-```text
-for each cluster, all LocalClusterPatternOnly edges are routed before that cluster's access/bridge/top edges
-for each cluster, access/bridge/top edges are routed before any global/source edge
-all clusters must be connected to their top before Stage B starts
-global/source edges are routed bottom-up toward source, not source-first
-```
 
 ---
 

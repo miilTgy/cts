@@ -1083,6 +1083,8 @@ static long long heuristic_cost(const ScaledPoint& a, const ScaledPoint& b) {
     return manhattan_scaled(a, b);
 }
 
+static double preferred_penalty_weight(Policy policy);
+
 static Candidate run_maze_search(const EdgeInfo& edge,
                                  const std::vector<ScaledPoint>& node_points,
                                  const std::vector<ScaledBBox>& node_bboxes,
@@ -1217,7 +1219,7 @@ static Candidate run_maze_search(const EdgeInfo& edge,
                 const double factor =
                     is_forward ? preferred_dir_factor(edge, dir, false)
                                : preferred_dir_factor(edge, dir, true);
-                step_cost += static_cast<long long>(factor * static_cast<double>(bend_weight));
+                step_cost += static_cast<long long>(factor * preferred_penalty_weight(edge.policy));
             }
             if (edge.policy != Policy::LocalClusterPatternOnly &&
                 !same_point(next, goal) &&
@@ -1818,6 +1820,7 @@ static std::vector<EdgeInfo> build_edges(const common::Problem& problem,
         static_cast<std::size_t>(tree.root) < tree.nodes.size()) {
         source_children.push_back(tree.root);
     }
+    const bool source_single_child = (source_children.size() == 1);
     for (int child : source_children) {
         if (child < 0 || static_cast<std::size_t>(child) >= tree.nodes.size()) {
             error_msg = "Invalid source child node id " + std::to_string(child);
@@ -1922,13 +1925,22 @@ static std::vector<EdgeInfo> build_edges(const common::Problem& problem,
                 }
             }
         } else {
+            if (source_single_child) {
+                const bool a_source_adjacent = a.parent_is_source;
+                const bool b_source_adjacent = b.parent_is_source;
+                if (a_source_adjacent != b_source_adjacent) {
+                    return a_source_adjacent;
+                }
+            }
             if (a.source_depth != b.source_depth) {
                 return a.source_depth > b.source_depth;
             }
-            const bool a_source_adjacent = a.parent_is_source;
-            const bool b_source_adjacent = b.parent_is_source;
-            if (a_source_adjacent != b_source_adjacent) {
-                return !a_source_adjacent;
+            if (!source_single_child) {
+                const bool a_source_adjacent = a.parent_is_source;
+                const bool b_source_adjacent = b.parent_is_source;
+                if (a_source_adjacent != b_source_adjacent) {
+                    return !a_source_adjacent;
+                }
             }
             if (a.manhattan_distance != b.manhattan_distance) {
                 return a.manhattan_distance < b.manhattan_distance;
