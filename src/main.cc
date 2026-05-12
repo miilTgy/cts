@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
         std::cerr << "BUFFERER error: " << bufferer_result.error_msg << "\n";
         return 1;
     }
+    // common::BuffererResult bufferer_result;  // dummy
 
     writer::WriterResult writer_result =
         writer::write_solution(argv[1], problem, tree, loc_result, route_result, bufferer_result);
