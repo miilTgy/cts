@@ -5,7 +5,7 @@
 ```
 Parser → Partitioner → Partreer (cluster topology) → Treer (global tree)
 → Locer (DME BU/TD + congestion-aware placement) → Router (Manhattan routing)
-→ Detourer (skew balancing) → Writer (solution output)
+→ Detourer (skew balancing) → Bufferer (buffer insertion for skew) → Writer (solution output)
 ```
 
 优先级：合法可布线性 > skew 潜力 > buffer cost > wirelength
@@ -388,26 +388,94 @@ delta = max(left_delay + edge, right_delay + edge) - min(...)
 
 ---
 
-## 8. Writer
+## 8. Bufferer — Skew-Driven Buffer Insertion
 
-### 策略：Edge Route 拼接为 Sink-to-Source Path
+### 问题定义
+
+在 route/detour 完成后，尝试在 topology node 上插入 buffer 以进一步降低 skew。buffer 不能插在 edge 中间，只能标记在非 sink/source 的 topology node 上。
+
+### 核心策略
+
+**8.1 Skew-first 原则**
+
+bufferer 的主要目标是 skew optimization，不是 fanout-driven insertion。只有满足以下条件才 commit：
+
+```text
+new_score > old_score
+score = 5000000 - 5000×skew - 50×wirelength - 200×buffer_cost
+```
+
+若 score 不改善，rollback 不插入。fanout 只做 legality check，不作为自动插 buffer 的触发器。
+
+**8.2 Delay model with node buffers**
+
+buffer 插在 node 上时，其 delay 计入从该 node 向上传播的所有 sink-to-root path：
+
+```text
+sink_delays_to_parent[node] = concat(
+    for each child c:
+        for d in sink_delays_to_node[c]:
+            d + buffer_delay[c] + edge_delay(node, c)
+)
+```
+
+叶子 sink delay=0。内部 node 汇总所有 child 的 delay + child 的 buffer delay（若有）+ edge delay。
+
+**8.3 Fanout legality**
+
+每个 node bottom-up 维护 `downstream_sink_count`：叶节点=1，内部节点=sum(children)。若 buffer 插在 node 上，必须满足：
+
+```text
+buffer_type.max_fanout >= downstream_sink_count[node]
+```
+
+不满足则 candidate 直接 reject。
+
+**8.4 Greedy multi-pass selection**
+
+算法流程（最多 `MAX_PASSES=20` 轮）：
+
+1. 收集合法候选 node（非 sink、非 source、尚未插 buffer 的内部 node）
+2. 对每个候选 node，枚举所有 buffer type：
+   - fanout 合法性检查
+   - 临时插入 buffer，recompute 全局 delay profile bottom-up
+   - 计算 objective_skew 和 score
+   - rollback 临时插入
+3. 选择 score 改善最大的 candidate（同 score 时选 skew 更低的）
+4. 若无可改善 candidate，停止
+5. commit 最优 candidate，进入下一轮
+
+**8.5 Objective skew 计算**
+
+objective_skew 计算 source virtual root 的 skew：若 source 有多个 children（`tree.source_children`），汇总所有 source child 的 delay；若 `tree.root` 有效，使用 root 的 subtree skew。
+
+**8.6 Buffer 位置约束**
+
+- 允许：internal、access、bridge、top、global node
+- 禁止：sink、source、edge midpoint、route turning point
+- 每个 node 最多一个 buffer；已 commit buffer 的 node 不再尝试
+- buffer 不改变 route polyline、endpoint、port
+
+---
+
+## 9. Writer
+
+### 策略：Edge Route 拼接 + Buffer 输出
 
 - 从 sink leaf node 沿 topology parent 链上溯到 source child
-- 按 segment 拼接各条 edge polyline
-- 使用去重追加（连续相同点合并）
+- 按 segment 拼接各条 edge polyline，去重追加
+- 每个 committed buffer 输出为 `b <id> <type> <node_id> <x> <y>`
 - 最终输出：`result/sample_k_solution.txt`
-- 当前输出 `NUM_BUFS 0`（buffer insertion 尚未完成，见 TODO）
 
 ---
 
-## 9. 未实现的功能（TODO）
+## 10. 未实现的功能（TODO）
 
-1. **Buffer insertion**：当前 buffer 只在 DME BU 阶段作为候选枚举，有 `buffer_at_left/right_child` 记录，但最终 solution 中 `NUM_BUFS 0`。预期策略为 top-down 遍历，在每个内部节点检查 fan-out 容量并选择 buffer。
-2. **2D global distribution**：当前 global placement 是 order-constrained 一维链，尚待考虑更完整的 2D 全局分布。
+1. **2D global distribution**：当前 global placement 是 order-constrained 一维链，尚待考虑更完整的 2D 全局分布。Buffer insertion 已完成（见 Section 8）。
 
 ---
 
-## 10. 关键几何/数据架构决策
+## 11. 关键几何/数据架构决策
 
 - **DME 几何全部使用 rotated coordinate (u, v)**：`u=x+y, v=x-y`，Manhattan 距离 = `max(Δu, Δv)`。TRR 在 (u,v) 中为 axis-aligned rectangle。
 - **全局使用整数坐标**：locer 输出前 snap 到整数 grid，router 用 scale=1 的整数 grid routing。

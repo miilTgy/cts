@@ -23,6 +23,7 @@ main
 *~
 *.swp
 *.swo
+tmp
 
 # IDE/editor settings
 .vscode/
