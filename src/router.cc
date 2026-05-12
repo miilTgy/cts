@@ -1149,10 +1149,19 @@ static Candidate run_maze_search(const EdgeInfo& edge,
 
     int expanded_fwd = 0;
     int expanded_bwd = 0;
+    int first_meeting_expansions = 0;
     bool found_meeting = false;
     ScaledState meeting_fwd;
     ScaledState meeting_bwd;
     long long meeting_cost = 0;
+
+    // Collect all meeting points for multi-candidate scoring
+    struct MeetingInfo {
+        ScaledState fwd;
+        ScaledState bwd;
+        long long cost = 0;
+    };
+    std::vector<MeetingInfo> all_meetings;
 
     auto expand_step = [&](const AStarNode& cur,
                            const ScaledPoint& goal,
@@ -1171,6 +1180,9 @@ static Candidate run_maze_search(const EdgeInfo& edge,
         }
 
         if (same_point(cur.state.point, goal)) {
+            if (!found_meeting) {
+                first_meeting_expansions = expanded_fwd + expanded_bwd;
+            }
             found_meeting = true;
             meeting_fwd = (is_forward ? cur.state : ScaledState{goal, Dir::None});
             meeting_bwd = (is_forward ? ScaledState{goal, Dir::None} : cur.state);
@@ -1226,11 +1238,15 @@ static Candidate run_maze_search(const EdgeInfo& edge,
             const PointKey pk = to_key(next);
             const auto other_point_it =
                 is_forward ? point_best_bwd.find(pk) : point_best_fwd.find(pk);
-            if (other_point_it != (is_forward ? point_best_bwd.end() : point_best_fwd.end())) {
-                found_meeting = true;
+                if (other_point_it != (is_forward ? point_best_bwd.end() : point_best_fwd.end())) {
+                    if (!found_meeting) {
+                        first_meeting_expansions = expanded_fwd + expanded_bwd;
+                    }
+                    found_meeting = true;
                 meeting_fwd = (is_forward ? next_state : best_state_fwd[pk]);
                 meeting_bwd = (is_forward ? best_state_bwd[pk] : next_state);
                 meeting_cost = tentative_g + other_point_it->second;
+                all_meetings.push_back(MeetingInfo{meeting_fwd, meeting_bwd, meeting_cost});
                 return;
             }
             auto& point_map = is_forward ? point_best_fwd : point_best_bwd;
@@ -1261,7 +1277,6 @@ static Candidate run_maze_search(const EdgeInfo& edge,
             expand_step(cur, edge.goal, pq_fwd, best_g_fwd, parent_fwd,
                         true, expanded_fwd, found_meeting,
                         meeting_fwd, meeting_bwd, meeting_cost);
-            if (found_meeting) break;
         }
         if (!pq_bwd.empty()) {
             const AStarNode cur = pq_bwd.top();
@@ -1270,16 +1285,26 @@ static Candidate run_maze_search(const EdgeInfo& edge,
             expand_step(cur, edge.start, pq_bwd, best_g_bwd, parent_bwd,
                         false, expanded_bwd, found_meeting,
                         meeting_fwd, meeting_bwd, meeting_cost);
-            if (found_meeting) break;
         }
+        // After first meeting, keep searching up to 500 more expansions
+        // to find paths with better preferred directions
+        if (expanded_fwd + expanded_bwd > 5000) break;
+        if (found_meeting && expanded_fwd + expanded_bwd > first_meeting_expansions + 500) break;
     }
 
     cand.expanded_nodes = expanded_fwd + expanded_bwd;
-    if (!found_meeting) {
+    if (all_meetings.empty()) {
         failure_reason = "NO_LEGAL_MAZE";
         cand.maze_failed_reason = failure_reason;
         return cand;
     }
+    // Pick best meeting (lowest g-cost = fewest bends + best directions)
+    std::sort(all_meetings.begin(), all_meetings.end(),
+              [](const MeetingInfo& a, const MeetingInfo& b) { return a.cost < b.cost; });
+    meeting_fwd = all_meetings[0].fwd;
+    meeting_bwd = all_meetings[0].bwd;
+    meeting_cost = all_meetings[0].cost;
+    found_meeting = true;
 
     std::vector<ScaledPoint> path;
     {

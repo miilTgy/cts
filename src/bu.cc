@@ -35,7 +35,7 @@ struct SegmentCandidate {
 };
 
 static constexpr double EPS = 1e-9;
-static constexpr double INF = std::numeric_limits<double>::infinity();
+static constexpr double INF = 1e30;
 
 static double to_u(double x, double y) {
     return x + y;

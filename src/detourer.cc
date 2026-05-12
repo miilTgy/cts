@@ -1388,8 +1388,8 @@ common::DetourerResult run(const common::Problem& problem,
                 return result;
             }
             int short_child = -1;
-            double short_delay = std::numeric_limits<double>::infinity();
-            double long_delay = -std::numeric_limits<double>::infinity();
+            double short_delay = 1e30;
+            double long_delay = -1e30;
             for (int child : children) {
                 double worst = 0.0;
                 if (!child_worst_delay(node_id, child, edge_map, edges,

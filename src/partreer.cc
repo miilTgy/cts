@@ -960,7 +960,7 @@ static MatchingPlan solve_min_cost_matching_rec(
     const int first = active[static_cast<std::size_t>(first_pos)];
 
     MatchingPlan best;
-    best.cost = std::numeric_limits<double>::infinity();
+    best.cost = 1e30;
 
     // Carry is allowed so odd levels keep exactly one unpaired node, and
     // disconnected candidate graphs can still advance without forcing bad pairs.
