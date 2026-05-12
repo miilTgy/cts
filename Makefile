@@ -1,6 +1,6 @@
 CC = g++
 CXX_STD = -std=c++17
-WARN_FLAGS = -Wall -Wextra -pedantic -O3
+WARN_FLAGS = -Wall -Wextra -pedantic -O3 -ffast-math
 SRC_DIR = src
 INC_DIR = include
 TARGET = cts
