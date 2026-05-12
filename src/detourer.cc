@@ -21,7 +21,7 @@ static bool g_debug_enabled = false;
 static bool g_debug_file_enabled = false;
 
 static constexpr double EPS = 1e-6;
-static constexpr int kMaxDetourLevel = 10;
+static constexpr int kMaxDetourLevel = 100;
 
 enum class Dir {
     None = 0,

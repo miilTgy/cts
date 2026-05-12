@@ -11,6 +11,7 @@
 #include "detourer.h"
 #include "writer.h"
 #include "partitioner.h"
+#include "bufferer.h"
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -29,6 +30,8 @@ int main(int argc, char** argv) {
     router::debug_file_enable(true);
     detourer::debug_enable(true);
     detourer::debug_file_enable(true);
+    bufferer::debug_enable(true);
+    bufferer::debug_file_enable(true);
     writer::debug_enable(true);
 
     common::Problem problem = parser::parse(argv[1]);
@@ -72,8 +75,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    common::BuffererResult bufferer_result =
+        bufferer::run(problem, tree, loc_result, route_result, argv[1]);
+    if (!bufferer_result.valid) {
+        std::cerr << "BUFFERER error: " << bufferer_result.error_msg << "\n";
+        return 1;
+    }
+
     writer::WriterResult writer_result =
-        writer::write_solution(argv[1], problem, tree, loc_result, route_result);
+        writer::write_solution(argv[1], problem, tree, loc_result, route_result, bufferer_result);
     if (!writer_result.valid) {
         std::cerr << "Writer error: " << writer_result.error_msg << "\n";
         return 1;

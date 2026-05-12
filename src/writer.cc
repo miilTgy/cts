@@ -454,15 +454,22 @@ static bool build_routes(const common::Problem& problem,
 }
 
 static bool write_output_file(const std::string& output_path,
-                              const std::vector<OutputRoute>& routes,
-                              std::string& err) {
+                               const std::vector<OutputRoute>& routes,
+                               const common::BuffererResult& bufferer_result,
+                               std::string& err) {
     std::ofstream fout(output_path);
     if (!fout) {
         err = "Cannot open output file: " + output_path;
         return false;
     }
 
-    fout << "NUM_BUFS 0\n";
+    fout << "NUM_BUFS " << bufferer_result.buffers.size() << "\n";
+    for (const common::BufferInsertion& buf : bufferer_result.buffers) {
+        int bx = static_cast<int>(std::llround(buf.loc.x));
+        int by = static_cast<int>(std::llround(buf.loc.y));
+        fout << "BUF " << buf.id << " " << buf.type_name << " "
+             << bx << " " << by << "\n";
+    }
     fout << "NUM_ROUTES " << routes.size() << "\n";
     for (const OutputRoute& route : routes) {
         fout << "ROUTE " << route.sink_id << " " << route.points.size() << "\n";
@@ -480,10 +487,11 @@ void debug_enable(bool enable) {
 }
 
 WriterResult write_solution(const std::string& input_path,
-                            const common::Problem& problem,
-                            const common::TopoTree& tree,
-                            const common::LocerResult& loc_result,
-                            const common::RouterResult& router_result) {
+                             const common::Problem& problem,
+                             const common::TopoTree& tree,
+                             const common::LocerResult& loc_result,
+                             const common::RouterResult& router_result,
+                             const common::BuffererResult& bufferer_result) {
     WriterResult result;
     result.output_path = make_output_path(input_path);
 
@@ -500,14 +508,14 @@ WriterResult write_solution(const std::string& input_path,
     if (!build_rounded_locs(problem, tree, loc_result, rounded_locs, err) ||
         !build_edge_map(problem, tree, rounded_locs, router_result, edge_routes, err) ||
         !build_routes(problem, tree, edge_routes, routes, err) ||
-        !write_output_file(result.output_path, routes, err)) {
+        !write_output_file(result.output_path, routes, bufferer_result, err)) {
         result.error_msg = err;
         return result;
     }
 
     if (g_debug_enabled) {
         std::cout << "[Writer] output_path=" << result.output_path << "\n";
-        std::cout << "[Writer] num_buffers=0\n";
+        std::cout << "[Writer] num_buffers=" << bufferer_result.buffers.size() << "\n";
         std::cout << "[Writer] num_routes=" << routes.size() << "\n";
         for (const OutputRoute& route : routes) {
             std::cout << "[Writer] route " << route.sink_id

@@ -347,4 +347,18 @@ struct DetourerResult {
     std::vector<DetourNodeResult> node_results;
 };
 
+struct BufferInsertion {
+    std::string id;
+    std::string type_name;
+    int node_id = -1;
+    SegmentPoint loc;
+};
+
+struct BuffererResult {
+    bool valid = false;
+    std::string error_msg;
+    std::vector<BufferInsertion> buffers;
+    int total_buffer_cost = 0;
+};
+
 }  // namespace common

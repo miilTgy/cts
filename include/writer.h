@@ -18,6 +18,7 @@ WriterResult write_solution(const std::string& input_path,
                             const common::Problem& problem,
                             const common::TopoTree& tree,
                             const common::LocerResult& loc_result,
-                            const common::RouterResult& router_result);
+                            const common::RouterResult& router_result,
+                            const common::BuffererResult& bufferer_result);
 
 }  // namespace writer
